@@ -5,101 +5,72 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: laramux-linux-x86_64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: laramux-linux-aarch64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: laramux-macos-x86_64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: laramux-macos-aarch64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: laramux-windows-x86_64.exe
+    name: Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          targets: ${{ matrix.target }}
+          persist-credentials: false
 
-      - name: Install cross-compilation tools (Linux aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+        with:
+          target: x86_64-unknown-linux-gnu
+          rustflags: ""
+          cache: false
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target x86_64-unknown-linux-gnu
 
-      - name: Copy binary (Unix)
-        if: runner.os != 'Windows'
-        run: cp target/${{ matrix.target }}/release/laramux ${{ matrix.name }}
-
-      - name: Copy binary (Windows)
-        if: runner.os == 'Windows'
-        run: cp target/${{ matrix.target }}/release/laramux.exe ${{ matrix.name }}
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          name: laramux-linux-x86_64
+          path: target/x86_64-unknown-linux-gnu/release/laramux
 
   release:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # required to create GitHub releases
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - name: Download artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
 
-      - name: Prepare release assets
+      - name: Prepare release
         run: |
           mkdir -p release
-          for dir in artifacts/laramux-*/; do
-            cp "$dir"* release/
-          done
-          ls -la release/
-
-      - name: Generate checksums
-        run: |
+          cp artifacts/laramux-linux-x86_64/laramux release/laramux-linux-x86_64
           cd release
           sha256sum * > checksums.txt
           cat checksums.txt
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release/*
-          generate_release_notes: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release create "$TAG_NAME" release/* --generate-notes
