@@ -1,6 +1,6 @@
 [package]
 name = "laramux"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2021"
 description = "A TUI application for managing Laravel development processes"
 authors = ["gvieira18"]
