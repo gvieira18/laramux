@@ -37,11 +37,14 @@ jobs:
       - name: Build
         run: cargo build --release --target x86_64-unknown-linux-gnu
 
+      - name: Prepare binary
+        run: cp target/x86_64-unknown-linux-gnu/release/laramux laramux-linux-x86_64
+
       - name: Upload binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: laramux-linux-x86_64
-          path: target/x86_64-unknown-linux-gnu/release/laramux
+          path: laramux-linux-x86_64
 
   release:
     name: Create Release
@@ -64,7 +67,7 @@ jobs:
       - name: Prepare release
         run: |
           mkdir -p release
-          cp artifacts/laramux-linux-x86_64/laramux release/laramux-linux-x86_64
+          cp artifacts/laramux-linux-x86_64/laramux-linux-x86_64 release/laramux-linux-x86_64
           cd release
           sha256sum * > checksums.txt
           cat checksums.txt
