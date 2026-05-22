@@ -56,17 +56,19 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Install panic hook for terminal restoration
-    tui::install_panic_hook();
+    let pid_registry = process::PidRegistry::new();
+
+    // Install panic hook for terminal restoration and process cleanup
+    tui::install_panic_hook(pid_registry.clone());
 
     // Get working directory
     let working_dir = std::env::current_dir()?;
 
     // Run the application
-    run(working_dir).await
+    run(working_dir, pid_registry).await
 }
 
-async fn run(working_dir: PathBuf) -> Result<()> {
+async fn run(working_dir: PathBuf, pid_registry: process::PidRegistry) -> Result<()> {
     // Load configuration (optional)
     let (config, config_error) = match LaramuxConfig::load(&working_dir) {
         Ok(cfg) => (cfg, None),
@@ -122,7 +124,8 @@ async fn run(working_dir: PathBuf) -> Result<()> {
     }
 
     // Initialize process manager
-    let mut process_manager = ProcessManager::new(event_tx.clone(), cancel_token.clone());
+    let mut process_manager =
+        ProcessManager::new(event_tx.clone(), cancel_token.clone(), pid_registry.clone());
     for config in discovery_result.configs {
         process_manager.register(config);
     }
@@ -134,6 +137,32 @@ async fn run(working_dir: PathBuf) -> Result<()> {
 
     // Initialize terminal
     let mut terminal = tui::init()?;
+
+    // Spawn OS signal handler for SIGTERM/SIGHUP (terminal close, kill command)
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let sig_cancel = cancel_token.clone();
+        let sig_registry = pid_registry.clone();
+        let sig_tx = event_tx.clone();
+
+        tokio::spawn(async move {
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            let mut sighup =
+                signal(SignalKind::hangup()).expect("failed to register SIGHUP handler");
+
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sighup.recv() => {}
+            }
+
+            sig_cancel.cancel();
+            let _ = sig_tx.send(Event::SignalShutdown).await;
+            sig_registry.kill_all_sync();
+        });
+    }
 
     // Spawn input handler task
     let input_tx = event_tx.clone();
@@ -313,6 +342,7 @@ async fn run(working_dir: PathBuf) -> Result<()> {
                         &command_stdin_writer,
                         &working_dir,
                         &cancel_token,
+                        &pid_registry,
                     )
                     .await;
                 }
@@ -458,6 +488,9 @@ async fn run(working_dir: PathBuf) -> Result<()> {
                 Event::SystemStatsUpdate(stats) => {
                     app.system_stats = stats;
                 }
+                Event::SignalShutdown => {
+                    app.quit();
+                }
             }
         }
 
@@ -468,7 +501,13 @@ async fn run(working_dir: PathBuf) -> Result<()> {
 
     // Cleanup
     cancel_token.cancel();
-    process_manager.kill_all().await?;
+
+    let kill_result =
+        tokio::time::timeout(Duration::from_secs(10), process_manager.kill_all()).await;
+    if kill_result.is_err() {
+        pid_registry.kill_all_sync();
+    }
+
     tui::restore()?;
 
     Ok(())
@@ -663,6 +702,7 @@ async fn handle_tab_keys(
     command_stdin_writer: &CommandStdinWriter,
     working_dir: &Path,
     main_cancel: &CancellationToken,
+    pid_registry: &process::PidRegistry,
 ) {
     match app.active_tab {
         Tab::Processes => {
@@ -680,6 +720,7 @@ async fn handle_tab_keys(
                 command_stdin_writer,
                 working_dir,
                 main_cancel,
+                pid_registry,
             )
             .await;
         }
@@ -692,6 +733,7 @@ async fn handle_tab_keys(
                 command_stdin_writer,
                 working_dir,
                 main_cancel,
+                pid_registry,
             )
             .await;
         }
@@ -704,6 +746,7 @@ async fn handle_tab_keys(
                 command_stdin_writer,
                 working_dir,
                 main_cancel,
+                pid_registry,
             )
             .await;
         }
@@ -881,6 +924,7 @@ fn handle_logs_keys(app: &mut App, key: &crossterm::event::KeyEvent) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_artisan_keys(
     app: &mut App,
     key: &crossterm::event::KeyEvent,
@@ -889,6 +933,7 @@ async fn handle_artisan_keys(
     command_stdin_writer: &CommandStdinWriter,
     working_dir: &Path,
     main_cancel: &CancellationToken,
+    pid_registry: &process::PidRegistry,
 ) {
     // If a command is running and input mode is active, collect input in buffer
     if app.artisan_tab.running_command.is_some() && app.artisan_tab.input_mode {
@@ -997,6 +1042,7 @@ async fn handle_artisan_keys(
                     working_dir,
                     main_cancel,
                     CommandTab::Artisan,
+                    pid_registry,
                 )
                 .await;
             }
@@ -1011,6 +1057,7 @@ async fn handle_artisan_keys(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_make_keys(
     app: &mut App,
     key: &crossterm::event::KeyEvent,
@@ -1019,6 +1066,7 @@ async fn handle_make_keys(
     command_stdin_writer: &CommandStdinWriter,
     working_dir: &Path,
     main_cancel: &CancellationToken,
+    pid_registry: &process::PidRegistry,
 ) {
     // If a command is running and input mode is active, collect input in buffer
     if app.make_tab.running_command.is_some() && app.make_tab.input_mode {
@@ -1133,6 +1181,7 @@ async fn handle_make_keys(
                     working_dir,
                     main_cancel,
                     CommandTab::Make,
+                    pid_registry,
                 )
                 .await;
             }
@@ -1147,6 +1196,7 @@ async fn handle_make_keys(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_quality_keys(
     app: &mut App,
     key: &crossterm::event::KeyEvent,
@@ -1155,6 +1205,7 @@ async fn handle_quality_keys(
     command_stdin_writer: &CommandStdinWriter,
     working_dir: &Path,
     main_cancel: &CancellationToken,
+    pid_registry: &process::PidRegistry,
 ) {
     // If a command is running and input mode is active, collect input in buffer
     if app.quality_tab.running_command.is_some() && app.quality_tab.input_mode {
@@ -1245,6 +1296,7 @@ async fn handle_quality_keys(
                     working_dir,
                     main_cancel,
                     CommandTab::Quality,
+                    pid_registry,
                 )
                 .await;
             }
@@ -1277,6 +1329,7 @@ async fn spawn_command(
     working_dir: &Path,
     main_cancel: &CancellationToken,
     tab: CommandTab,
+    pid_registry: &process::PidRegistry,
 ) {
     let full_args = resolved.args.clone();
 
@@ -1315,6 +1368,7 @@ async fn spawn_command(
     let cancel = CancellationToken::new();
     let main_cancel = main_cancel.clone();
     let stdin_writer_clone = command_stdin_writer.clone();
+    let cmd_registry = pid_registry.clone();
 
     {
         let mut guard = command_cancel.lock().await;
@@ -1329,6 +1383,7 @@ async fn spawn_command(
             .current_dir(&working_dir)
             .env("FORCE_COLOR", "1")
             .env("CLICOLOR_FORCE", "1")
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1416,10 +1471,12 @@ async fn spawn_command(
             });
         }
 
-        // Capture PID before the select for process group killing
         let child_pid = child.id();
 
-        // Wait for process to exit
+        if let Some(pid) = child_pid {
+            cmd_registry.insert(pid);
+        }
+
         tokio::select! {
             _ = cancel.cancelled() => {
                 #[cfg(unix)]
@@ -1457,6 +1514,10 @@ async fn spawn_command(
                     }
                 }
             }
+        }
+
+        if let Some(pid) = child_pid {
+            cmd_registry.remove(pid);
         }
 
         // Clear the stdin writer

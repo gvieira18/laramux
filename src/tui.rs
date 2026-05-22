@@ -7,6 +7,7 @@ use crossterm::{
 use ratatui::prelude::*;
 
 use crate::error::Result;
+use crate::process::PidRegistry;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -26,10 +27,11 @@ pub fn restore() -> Result<()> {
     Ok(())
 }
 
-/// Install panic hook to restore terminal on panic
-pub fn install_panic_hook() {
+/// Install panic hook to restore terminal and kill child processes on panic
+pub fn install_panic_hook(pid_registry: PidRegistry) {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
+        pid_registry.kill_all_sync();
         let _ = restore();
         original_hook(panic_info);
     }));

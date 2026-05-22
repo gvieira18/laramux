@@ -45,4 +45,7 @@ pub enum Event {
 
     /// System stats update
     SystemStatsUpdate(SystemStats),
+
+    /// OS signal received (SIGTERM, SIGHUP) — trigger graceful shutdown
+    SignalShutdown,
 }

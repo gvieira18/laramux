@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -11,6 +12,60 @@ use crate::config::RestartPolicy;
 use crate::error::{LaraMuxError, Result};
 use crate::event::Event;
 use crate::process::types::{ProcessConfig, ProcessId};
+
+/// Thread-safe registry of active process group IDs.
+/// Accessible from sync contexts (signal handlers, panic hooks, Drop).
+#[derive(Clone, Debug, Default)]
+pub struct PidRegistry {
+    inner: Arc<StdMutex<HashSet<u32>>>,
+}
+
+impl PidRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(StdMutex::new(HashSet::new())),
+        }
+    }
+
+    pub fn insert(&self, pgid: u32) {
+        if let Ok(mut set) = self.inner.lock() {
+            set.insert(pgid);
+        }
+    }
+
+    pub fn remove(&self, pgid: u32) {
+        if let Ok(mut set) = self.inner.lock() {
+            set.remove(&pgid);
+        }
+    }
+
+    /// Synchronously kill all registered process groups and their descendants.
+    /// Safe to call from panic hooks and signal handlers.
+    pub fn kill_all_sync(&self) {
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+
+            let pids: Vec<u32> = if let Ok(set) = self.inner.lock() {
+                set.iter().copied().collect()
+            } else {
+                return;
+            };
+
+            for &pgid in &pids {
+                let _ = kill(Pid::from_raw(-(pgid as i32)), Signal::SIGTERM);
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(200));
+
+            for &pgid in &pids {
+                let _ = kill(Pid::from_raw(-(pgid as i32)), Signal::SIGKILL);
+                verify_and_cleanup(pgid);
+            }
+        }
+    }
+}
 
 /// Maximum backoff delay for restarts (60 seconds)
 const MAX_RESTART_BACKOFF_SECS: u64 = 60;
@@ -53,17 +108,28 @@ pub struct ProcessManager {
     restart_states: HashMap<ProcessId, RestartState>,
     event_tx: mpsc::Sender<Event>,
     cancel_token: CancellationToken,
+    pid_registry: PidRegistry,
 }
 
 impl ProcessManager {
-    pub fn new(event_tx: mpsc::Sender<Event>, cancel_token: CancellationToken) -> Self {
+    pub fn new(
+        event_tx: mpsc::Sender<Event>,
+        cancel_token: CancellationToken,
+        pid_registry: PidRegistry,
+    ) -> Self {
         Self {
             children: HashMap::new(),
             configs: HashMap::new(),
             restart_states: HashMap::new(),
             event_tx,
             cancel_token,
+            pid_registry,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn pid_registry(&self) -> &PidRegistry {
+        &self.pid_registry
     }
 
     /// Register a process configuration
@@ -128,6 +194,10 @@ impl ProcessManager {
         self.restart_states.entry(id.clone()).or_default().reset();
 
         let pid = child.id();
+
+        if let Some(pid) = pid {
+            self.pid_registry.insert(pid);
+        }
 
         // Spawn stdout reader task
         if let Some(stdout) = child.stdout.take() {
@@ -236,10 +306,8 @@ impl ProcessManager {
     /// Kill a process gracefully (SIGTERM, wait, then SIGKILL)
     pub async fn kill(&mut self, id: &ProcessId) -> Result<()> {
         if let Some(mut child) = self.children.remove(id) {
-            // Capture PID before any wait calls
             let pid = child.id();
 
-            // Try graceful shutdown first — signal the entire process group
             #[cfg(unix)]
             {
                 use nix::sys::signal::{kill, Signal};
@@ -255,7 +323,6 @@ impl ProcessManager {
                 let _ = child.kill().await;
             }
 
-            // Wait for process to exit with timeout
             let timeout = tokio::time::timeout(tokio::time::Duration::from_secs(5), child.wait());
 
             match timeout.await {
@@ -269,7 +336,6 @@ impl ProcessManager {
                         .await;
                 }
                 _ => {
-                    // Force kill the entire process group if timeout
                     #[cfg(unix)]
                     {
                         use nix::sys::signal::{kill, Signal};
@@ -290,6 +356,12 @@ impl ProcessManager {
                         .await;
                 }
             }
+
+            if let Some(pid) = pid {
+                #[cfg(unix)]
+                verify_and_cleanup(pid);
+                self.pid_registry.remove(pid);
+            }
         }
         Ok(())
     }
@@ -298,21 +370,21 @@ impl ProcessManager {
     pub async fn kill_all(&mut self) -> Result<()> {
         use futures::future::join_all;
 
-        // Extract all children for parallel killing
         let children: Vec<(ProcessId, Child)> = self.children.drain().collect();
         if children.is_empty() {
             return Ok(());
         }
 
         let event_tx = self.event_tx.clone();
+        let registry = self.pid_registry.clone();
 
-        // Kill all processes in parallel
         let futures: Vec<_> = children
             .into_iter()
             .map(|(id, child)| {
                 let tx = event_tx.clone();
+                let reg = registry.clone();
                 async move {
-                    kill_child(child, &id, &tx).await;
+                    kill_child(child, &id, &tx, &reg).await;
                 }
             })
             .collect();
@@ -407,11 +479,14 @@ impl ProcessManager {
 }
 
 /// Helper to kill a single child process with timeout
-async fn kill_child(mut child: Child, id: &ProcessId, event_tx: &mpsc::Sender<Event>) {
-    // Capture PID before any wait calls
+async fn kill_child(
+    mut child: Child,
+    id: &ProcessId,
+    event_tx: &mpsc::Sender<Event>,
+    registry: &PidRegistry,
+) {
     let pid = child.id();
 
-    // Try graceful shutdown first — signal the entire process group
     #[cfg(unix)]
     {
         use nix::sys::signal::{kill, Signal};
@@ -427,8 +502,7 @@ async fn kill_child(mut child: Child, id: &ProcessId, event_tx: &mpsc::Sender<Ev
         let _ = child.kill().await;
     }
 
-    // Wait for process to exit with shorter timeout for quit (1 second)
-    let timeout = tokio::time::timeout(tokio::time::Duration::from_secs(1), child.wait());
+    let timeout = tokio::time::timeout(tokio::time::Duration::from_secs(3), child.wait());
 
     match timeout.await {
         Ok(Ok(status)) => {
@@ -440,7 +514,6 @@ async fn kill_child(mut child: Child, id: &ProcessId, event_tx: &mpsc::Sender<Ev
                 .await;
         }
         _ => {
-            // Force kill the entire process group if timeout
             #[cfg(unix)]
             {
                 use nix::sys::signal::{kill, Signal};
@@ -459,5 +532,258 @@ async fn kill_child(mut child: Child, id: &ProcessId, event_tx: &mpsc::Sender<Ev
                 })
                 .await;
         }
+    }
+
+    if let Some(pid) = pid {
+        #[cfg(unix)]
+        verify_and_cleanup(pid);
+        registry.remove(pid);
+    }
+}
+
+/// Walk /proc to find all descendant PIDs of root_pid.
+/// Returns children-first order for bottom-up killing.
+#[cfg(target_os = "linux")]
+fn find_descendant_pids(root_pid: u32) -> Vec<u32> {
+    let mut descendants = Vec::new();
+    let mut queue = vec![root_pid];
+
+    while let Some(parent) = queue.pop() {
+        let entries = match std::fs::read_dir("/proc") {
+            Ok(e) => e,
+            Err(_) => break,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            let Ok(pid) = name_str.parse::<u32>() else {
+                continue;
+            };
+            let stat_path = format!("/proc/{}/stat", pid);
+            let Ok(stat) = std::fs::read_to_string(&stat_path) else {
+                continue;
+            };
+            // Format: pid (comm) state ppid ...
+            let Some(after_comm) = stat.rfind(')') else {
+                continue;
+            };
+            let rest = &stat[after_comm + 2..];
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            if let Some(ppid_str) = fields.get(1) {
+                if let Ok(ppid) = ppid_str.parse::<u32>() {
+                    if ppid == parent {
+                        descendants.push(pid);
+                        queue.push(pid);
+                    }
+                }
+            }
+        }
+    }
+
+    descendants.reverse();
+    descendants
+}
+
+/// After process group kill, find and kill any surviving descendants.
+#[cfg(unix)]
+fn verify_and_cleanup(root_pid: u32) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    // Check if anything in the process group is still alive
+    if kill(Pid::from_raw(-(root_pid as i32)), Signal::SIGCONT).is_err() {
+        return;
+    }
+
+    // Process group still has survivors — walk the tree and kill individually
+    #[cfg(target_os = "linux")]
+    {
+        let descendants = find_descendant_pids(root_pid);
+        for pid in &descendants {
+            let _ = kill(Pid::from_raw(*pid as i32), Signal::SIGKILL);
+        }
+    }
+
+    let _ = kill(Pid::from_raw(root_pid as i32), Signal::SIGKILL);
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod tests {
+    use super::*;
+    use std::os::unix::process::CommandExt as StdCommandExt;
+    use std::process::Command as StdCommand;
+
+    /// Spawn a process in its own process group (matching production behavior).
+    fn spawn_in_group(cmd: &str, args: &[&str]) -> std::process::Child {
+        let mut c = StdCommand::new(cmd);
+        c.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        c.spawn().expect("failed to spawn process")
+    }
+
+    #[test]
+    fn find_descendant_pids_discovers_child_processes() {
+        // Spawn: sh → sleep (a parent with one child)
+        let mut parent = spawn_in_group("sh", &["-c", "sleep 300"]);
+        let parent_pid = parent.id();
+
+        // Give the shell time to fork sleep
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let descendants = find_descendant_pids(parent_pid);
+        assert!(!descendants.is_empty(), "should find at least 1 descendant (sleep)");
+
+        // Every descendant should be a real PID
+        for pid in &descendants {
+            assert!(
+                std::path::Path::new(&format!("/proc/{}", pid)).exists(),
+                "descendant PID {} should exist in /proc",
+                pid
+            );
+        }
+
+        // Cleanup
+        let _ = parent.kill();
+        let _ = parent.wait();
+    }
+
+    #[test]
+    fn find_descendant_pids_discovers_nested_tree() {
+        // Spawn: sh → sh → sleep (3 levels deep)
+        let mut root = spawn_in_group("sh", &["-c", "sh -c 'sleep 300' & wait"]);
+
+        let root_pid = root.id();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let descendants = find_descendant_pids(root_pid);
+        assert!(
+            descendants.len() >= 2,
+            "should find at least 2 descendants (inner sh + sleep), got {}",
+            descendants.len()
+        );
+
+        // Cleanup
+        let _ = root.kill();
+        let _ = root.wait();
+        for pid in &descendants {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+            let _ = kill(Pid::from_raw(*pid as i32), Signal::SIGKILL);
+        }
+    }
+
+    #[test]
+    fn find_descendant_pids_returns_empty_for_leaf_process() {
+        // sleep has no children
+        let mut leaf = spawn_in_group("sleep", &["300"]);
+
+        let leaf_pid = leaf.id();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let descendants = find_descendant_pids(leaf_pid);
+        assert!(descendants.is_empty(), "leaf process should have no descendants");
+
+        let _ = leaf.kill();
+        let _ = leaf.wait();
+    }
+
+    #[test]
+    fn find_descendant_pids_returns_empty_for_nonexistent_pid() {
+        // PID 999999999 almost certainly doesn't exist
+        let descendants = find_descendant_pids(999_999_999);
+        assert!(descendants.is_empty());
+    }
+
+    #[test]
+    fn verify_and_cleanup_kills_entire_tree() {
+        use nix::sys::signal::{kill as nix_kill, Signal};
+        use nix::unistd::Pid;
+
+        // Spawn a process group: sh → sleep & sleep & wait
+        let mut root = spawn_in_group("sh", &["-c", "sleep 300 & sleep 300 & wait"]);
+
+        let root_pid = root.id();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let descendants_before = find_descendant_pids(root_pid);
+        assert!(
+            !descendants_before.is_empty(),
+            "should have descendants before cleanup"
+        );
+
+        verify_and_cleanup(root_pid);
+
+        // Reap the root zombie (direct child of test process)
+        let _ = root.wait();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Root should be fully reaped — signal check returns ESRCH
+        let root_dead = nix_kill(Pid::from_raw(root_pid as i32), Signal::SIGCONT).is_err();
+        assert!(root_dead, "root process should be dead after verify_and_cleanup");
+
+        // Descendants were orphaned to init, which reaps them after SIGKILL
+        for pid in &descendants_before {
+            let alive = nix_kill(Pid::from_raw(*pid as i32), Signal::SIGCONT).is_ok();
+            assert!(!alive, "descendant PID {} should be dead after cleanup", pid);
+        }
+    }
+
+    #[test]
+    fn pid_registry_insert_remove() {
+        let registry = PidRegistry::new();
+        registry.insert(1234);
+        registry.insert(5678);
+
+        let set = registry.inner.lock().unwrap();
+        assert!(set.contains(&1234));
+        assert!(set.contains(&5678));
+        assert_eq!(set.len(), 2);
+        drop(set);
+
+        registry.remove(1234);
+        let set = registry.inner.lock().unwrap();
+        assert!(!set.contains(&1234));
+        assert!(set.contains(&5678));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn pid_registry_kill_all_sync_on_empty_is_noop() {
+        let registry = PidRegistry::new();
+        // Should not panic
+        registry.kill_all_sync();
+    }
+
+    #[test]
+    fn pid_registry_kill_all_sync_kills_real_processes() {
+        use nix::sys::signal::{kill as nix_kill, Signal};
+        use nix::unistd::Pid;
+
+        let registry = PidRegistry::new();
+
+        let mut child1 = spawn_in_group("sleep", &["300"]);
+        let mut child2 = spawn_in_group("sleep", &["300"]);
+
+        let pid1 = child1.id();
+        let pid2 = child2.id();
+        registry.insert(pid1);
+        registry.insert(pid2);
+
+        registry.kill_all_sync();
+
+        // Reap zombies (direct children of test process)
+        let _ = child1.wait();
+        let _ = child2.wait();
+
+        let dead1 = nix_kill(Pid::from_raw(pid1 as i32), Signal::SIGCONT).is_err();
+        let dead2 = nix_kill(Pid::from_raw(pid2 as i32), Signal::SIGCONT).is_err();
+        assert!(dead1, "child1 should be dead");
+        assert!(dead2, "child2 should be dead");
     }
 }
