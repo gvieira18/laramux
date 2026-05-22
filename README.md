@@ -1,10 +1,13 @@
-# LaraMux
+# LaraMux (Fork)
+
+> **Fork of [jonaspauleta/laramux](https://github.com/jonaspauleta/laramux)** — original work by [@jonaspauleta](https://github.com/jonaspauleta), licensed under MIT.
+> This fork adds robust process cleanup, signal handling improvements, and other enhancements.
 
 A terminal UI application for managing Laravel development processes in a single terminal window.
 
 ![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Downloads](https://img.shields.io/github/downloads/jonaspauleta/laramux/v1.0.0/total)
+![Downloads](https://img.shields.io/github/downloads/gvieira18/laramux/v1.0.0/total)
 
 ![LaraMux Preview](public/preview.gif)
 
@@ -13,10 +16,6 @@ A terminal UI application for managing Laravel development processes in a single
 - [Features](#features)
 - [Installation](#installation)
   - [Quick Install](#quick-install-linux--macos)
-  - [Cargo](#cargo-cratesio)
-  - [Homebrew](#homebrew-macos--linux)
-  - [apt (Debian/Ubuntu)](#apt-debianubuntu)
-  - [dnf (Fedora/RHEL)](#dnf-fedorarhel)
   - [Download Binary](#download-binary)
   - [Build from Source](#build-from-source)
 - [Updating](#updating)
@@ -58,49 +57,12 @@ A terminal UI application for managing Laravel development processes in a single
 ### Quick Install (Linux & macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jonaspauleta/laramux/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/gvieira18/laramux/main/install.sh | sh
 ```
-
-### Cargo (crates.io)
-
-```bash
-cargo install laramux
-```
-
-### Homebrew (macOS & Linux)
-
-```bash
-brew tap jonaspauleta/tap
-brew install laramux
-```
-
-### apt (Debian/Ubuntu)
-
-```bash
-# Download the .deb package
-curl -LO https://github.com/jonaspauleta/laramux/releases/latest/download/laramux_amd64.deb
-
-# Install
-sudo dpkg -i laramux_amd64.deb
-```
-
-For ARM64 systems, use `laramux_arm64.deb` instead.
-
-### dnf (Fedora/RHEL)
-
-```bash
-# Download the .rpm package
-curl -LO https://github.com/jonaspauleta/laramux/releases/latest/download/laramux_x86_64.rpm
-
-# Install
-sudo dnf install ./laramux_x86_64.rpm
-```
-
-For ARM64 systems, use `laramux_aarch64.rpm` instead.
 
 ### Download Binary
 
-Download pre-built binaries from [GitHub Releases](https://github.com/jonaspauleta/laramux/releases):
+Download pre-built binaries from [GitHub Releases](https://github.com/gvieira18/laramux/releases):
 
 | Platform | Binary |
 |----------|--------|
@@ -112,7 +74,7 @@ Download pre-built binaries from [GitHub Releases](https://github.com/jonaspaule
 
 ```bash
 # Example: macOS Apple Silicon
-curl -L https://github.com/jonaspauleta/laramux/releases/latest/download/laramux-macos-aarch64 -o laramux
+curl -L https://github.com/gvieira18/laramux/releases/latest/download/laramux-macos-aarch64 -o laramux
 chmod +x laramux
 sudo mv laramux /usr/local/bin/
 ```
@@ -122,7 +84,7 @@ sudo mv laramux /usr/local/bin/
 Requires [Rust](https://rustup.rs/) 1.70 or later.
 
 ```bash
-git clone https://github.com/jonaspauleta/laramux.git
+git clone https://github.com/gvieira18/laramux.git
 cd laramux
 cargo install --path .
 ```
@@ -248,7 +210,7 @@ For IDE autocompletion and validation, add the schema reference:
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/jonaspauleta/laramux/main/.laramux.schema.json"
+  "$schema": "https://raw.githubusercontent.com/gvieira18/laramux/main/.laramux.schema.json"
 }
 ```
 
@@ -448,7 +410,7 @@ Auto-restart uses exponential backoff (2^failures seconds, max 60s) to prevent r
 
 ```json
 {
-  "$schema": "https://raw.githubusercontent.com/jonaspauleta/laramux/main/.laramux.schema.json",
+  "$schema": "https://raw.githubusercontent.com/gvieira18/laramux/main/.laramux.schema.json",
   "disabled": {
     "serve": true
   },

@@ -131,7 +131,7 @@ pub fn render(frame: &mut Frame, area: Rect, _app: &App) {
         Line::from(""),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "github.com/jonaspauleta/laramux",
+            "github.com/gvieira18/laramux",
             Style::default()
                 .fg(Theme::TEXT_MUTED)
                 .add_modifier(Modifier::ITALIC),

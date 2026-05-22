@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="jonaspauleta/laramux"
+REPO="gvieira18/laramux"
 BINARY_NAME="laramux"
 INSTALL_DIR="/usr/local/bin"
 

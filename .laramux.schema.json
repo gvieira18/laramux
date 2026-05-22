@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/jonaspauleta/laramux/blob/main/.laramux.schema.json",
+  "$id": "https://github.com/gvieira18/laramux/blob/main/.laramux.schema.json",
   "title": "LaraMux Configuration",
   "description": "Configuration schema for LaraMux - Laravel development process manager",
   "type": "object",

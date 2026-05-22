@@ -3,7 +3,7 @@ use std::process::Command;
 
 use crate::error::{LaraMuxError, Result};
 
-const REPO: &str = "jonaspauleta/laramux";
+const REPO: &str = "gvieira18/laramux";
 
 pub fn print_help() {
     println!("laramux {}", env!("CARGO_PKG_VERSION"));
