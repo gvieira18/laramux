@@ -24,11 +24,11 @@ use tokio_util::sync::CancellationToken;
 /// Sender for writing to a running command's stdin
 type CommandStdinWriter = Arc<Mutex<Option<tokio::process::ChildStdin>>>;
 
-use app::{App, ProcessesView};
+use app::{App, LogsPaneFocus, ProcessesView};
 use config::LaramuxConfig;
 use error::Result;
 use event::Event;
-use log::{find_log_dir, LogWatcher};
+use log::{find_log_dir, LogEntryParser, LogWatcher};
 use process::types::OutputLine;
 use process::{discover_services, ProcessManager, ProcessStatus};
 use ui::tabs::Tab;
@@ -302,6 +302,12 @@ async fn run(working_dir: PathBuf, pid_registry: process::PidRegistry) -> Result
         ));
     }
 
+    // Compute log directory path for the logs tab
+    let log_dir_path = working_dir.join("storage/logs");
+
+    // Live parser for streaming log entries from laravel.log
+    let mut live_parser = LogEntryParser::new();
+
     // Main event loop
     loop {
         // Render UI
@@ -416,13 +422,41 @@ async fn run(working_dir: PathBuf, pid_registry: process::PidRegistry) -> Result
                     }
                 }
                 Event::LogUpdate(lines) => {
-                    app.add_log_lines(lines);
+                    app.add_log_lines(lines.clone());
+
+                    // Also parse into structured entries for the new log viewer
+                    if app.logs_tab.active_file.as_deref() == Some("laravel.log")
+                        || app.logs_tab.active_file.is_none()
+                    {
+                        for raw_entry in &lines {
+                            live_parser.feed(&raw_entry.content);
+                            live_parser.feed("\n");
+                        }
+                        for entry in live_parser.drain_complete() {
+                            app.logs_tab.add_entry(entry);
+                        }
+                    }
                 }
-                Event::LogFilesChanged(_filenames) => {
-                    // Will be wired up in Task 6
+                Event::LogFilesChanged(filenames) => {
+                    app.logs_tab.file_tree.update_files(filenames);
+                    // Auto-select initial file on first load
+                    if app.logs_tab.active_file.is_none() {
+                        let initial = determine_initial_file(&app.logs_tab.file_tree.files);
+                        if let Some(filename) = initial {
+                            trigger_file_load(&mut app, &filename, &event_tx, &log_dir_path);
+                        }
+                    }
                 }
-                Event::LogFileLoaded { .. } => {
-                    // Will be wired up in Task 6
+                Event::LogFileLoaded { filename, entries } => {
+                    if app.logs_tab.active_file.as_deref() == Some(&filename) {
+                        app.logs_tab.entries.clear();
+                        app.logs_tab.expanded_entries.clear();
+                        app.logs_tab.selected_entry = 0;
+                        for entry in entries {
+                            app.logs_tab.add_entry(entry);
+                        }
+                        app.clear_status();
+                    }
                 }
                 Event::CommandOutput { line, is_stderr } => {
                     let output_line = if is_stderr {
@@ -715,7 +749,7 @@ async fn handle_tab_keys(
             handle_processes_keys(app, key, process_manager).await;
         }
         Tab::Logs => {
-            handle_logs_keys(app, key);
+            handle_logs_keys(app, key, event_tx, &working_dir.join("storage/logs"));
         }
         Tab::Artisan => {
             handle_artisan_keys(
@@ -891,43 +925,134 @@ async fn handle_processes_keys(
     }
 }
 
-fn handle_logs_keys(app: &mut App, key: &crossterm::event::KeyEvent) {
-    match key.code {
-        KeyCode::Char('/') => {
-            app.logs_tab.input_mode = true;
-        }
-        KeyCode::Char('f') => {
-            app.logs_tab.cycle_filter();
-        }
-        KeyCode::Char('F') => {
-            app.logs_tab.cycle_file();
-        }
-        KeyCode::Char('c') => {
-            app.clear_logs();
-        }
-        KeyCode::Char('g') => {
-            // Go to top
-            let filtered = app.filtered_logs();
-            app.logs_tab.scroll_offset = filtered.len();
-        }
-        KeyCode::Char('G') => {
-            // Go to bottom
-            app.logs_tab.scroll_offset = 0;
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.scroll_log_up(1);
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.scroll_log_down(1);
-        }
-        KeyCode::PageUp => {
-            app.scroll_log_up(10);
-        }
-        KeyCode::PageDown => {
-            app.scroll_log_down(10);
-        }
-        _ => {}
+fn handle_logs_keys(
+    app: &mut App,
+    key: &crossterm::event::KeyEvent,
+    event_tx: &mpsc::Sender<Event>,
+    log_dir: &Path,
+) {
+    match app.logs_tab.focus {
+        LogsPaneFocus::FileTree => match key.code {
+            KeyCode::Down | KeyCode::Char('j') => app.logs_tab.file_tree.select_next(),
+            KeyCode::Up | KeyCode::Char('k') => app.logs_tab.file_tree.select_previous(),
+            KeyCode::Enter => {
+                if let Some(filename) = app.logs_tab.file_tree.selected_file() {
+                    let filename = filename.to_string();
+                    trigger_file_load(app, &filename, event_tx, log_dir);
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(filename) = app.logs_tab.file_tree.selected_file() {
+                    let filename = filename.to_string();
+                    if app.logs_tab.active_file.as_deref() != Some(&filename) {
+                        trigger_file_load(app, &filename, event_tx, log_dir);
+                    }
+                }
+                app.logs_tab.focus = LogsPaneFocus::Entries;
+            }
+            _ => {}
+        },
+        LogsPaneFocus::Entries => match key.code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                app.logs_tab.focus = LogsPaneFocus::FileTree;
+            }
+            KeyCode::Down | KeyCode::Char('j') => app.logs_tab.select_next_entry(),
+            KeyCode::Up | KeyCode::Char('k') => app.logs_tab.select_previous_entry(),
+            KeyCode::Enter => app.logs_tab.toggle_expand(),
+            KeyCode::Char('e') => app.logs_tab.expand_all(),
+            KeyCode::Char('E') => app.logs_tab.collapse_all(),
+            KeyCode::Char('/') => {
+                app.logs_tab.input_mode = true;
+            }
+            KeyCode::Char('f') => app.logs_tab.cycle_filter(),
+            KeyCode::Char('r') => {
+                if app.logs_tab.view_mode == Some(crate::app::LogViewMode::Static) {
+                    if let Some(filename) = app.logs_tab.active_file.clone() {
+                        trigger_file_load(app, &filename, event_tx, log_dir);
+                    }
+                }
+            }
+            KeyCode::Char('c') => {
+                if app.logs_tab.view_mode == Some(crate::app::LogViewMode::Live) {
+                    app.logs_tab.entries.clear();
+                    app.logs_tab.expanded_entries.clear();
+                    app.logs_tab.selected_entry = 0;
+                    app.logs_tab.scroll_offset = 0;
+                }
+            }
+            KeyCode::Char('g') => app.logs_tab.jump_to_top(),
+            KeyCode::Char('G') => app.logs_tab.jump_to_bottom(),
+            KeyCode::PageUp => {
+                app.logs_tab.scroll_offset = app.logs_tab.scroll_offset.saturating_add(10);
+            }
+            KeyCode::PageDown => {
+                app.logs_tab.scroll_offset = app.logs_tab.scroll_offset.saturating_sub(10);
+            }
+            _ => {}
+        },
     }
+}
+
+fn trigger_file_load(
+    app: &mut App,
+    filename: &str,
+    event_tx: &mpsc::Sender<Event>,
+    log_dir: &Path,
+) {
+    app.logs_tab.select_file(filename);
+    app.set_status(format!("Loading {}...", filename));
+
+    if filename == "laravel.log" {
+        // Live mode -- entries come from the watcher's LogUpdate events
+        // Just clear and let the live stream populate
+        app.clear_status();
+        return;
+    }
+
+    // Static mode -- spawn blocking read
+    let path = log_dir.join(filename);
+    let max_entries = app.logs_tab.max_entries;
+    let tx = event_tx.clone();
+    let fname = filename.to_string();
+
+    tokio::spawn(async move {
+        let result =
+            tokio::task::spawn_blocking(move || crate::log::read_static_file(&path, max_entries))
+                .await;
+
+        match result {
+            Ok(Ok((entries, _skipped))) => {
+                let _ = tx
+                    .send(Event::LogFileLoaded {
+                        filename: fname,
+                        entries,
+                    })
+                    .await;
+            }
+            Ok(Err(e)) => {
+                eprintln!("Failed to read log file: {}", e);
+            }
+            Err(e) => {
+                eprintln!("Spawn blocking failed: {}", e);
+            }
+        }
+    });
+}
+
+fn determine_initial_file(files: &[String]) -> Option<String> {
+    // 1. laravel.log
+    if files.iter().any(|f| f == "laravel.log") {
+        return Some("laravel.log".to_string());
+    }
+    // 2. Most recent laravel-YYYY-MM-DD.log
+    if let Some(f) = files
+        .iter()
+        .find(|f| f.starts_with("laravel-") && f.ends_with(".log"))
+    {
+        return Some(f.clone());
+    }
+    // 3. First file (most recent by sort order)
+    files.first().cloned()
 }
 
 #[allow(clippy::too_many_arguments)]
