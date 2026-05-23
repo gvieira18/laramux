@@ -1,17 +1,25 @@
 use ratatui::{
     prelude::*,
-    widgets::{
-        Block, BorderType, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, Wrap,
-    },
+    widgets::{Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
-use crate::app::{App, LogLevel, LogLine};
+use crate::app::{App, LogLevel, LogViewMode, LogsPaneFocus};
+use crate::log::entry::LogEntry as ParsedLogEntry;
+use crate::ui::tabs::log_file_tree;
 use crate::ui::theme::Theme;
 
-/// Format a log line with timestamp, right-aligned level badge, and message
-fn format_log_line(log_line: &LogLine) -> Line<'static> {
-    let level_color = match log_line.level {
+pub fn render(frame: &mut Frame, area: Rect, app: &App) {
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
+        .split(area);
+
+    log_file_tree::render(frame, horizontal[0], app);
+    render_entries(frame, horizontal[1], app);
+}
+
+fn level_color(level: &LogLevel) -> Color {
+    match level {
         LogLevel::Emergency | LogLevel::Alert | LogLevel::Critical => Theme::LOG_CRITICAL,
         LogLevel::Error => Theme::LOG_ERROR,
         LogLevel::Warning => Theme::LOG_WARNING,
@@ -19,120 +27,336 @@ fn format_log_line(log_line: &LogLine) -> Line<'static> {
         LogLevel::Info => Theme::LOG_INFO,
         LogLevel::Debug => Theme::LOG_DEBUG,
         LogLevel::Unknown => Theme::TEXT_MUTED,
-    };
+    }
+}
 
-    let level_text = match log_line.level {
+fn level_text(level: &LogLevel) -> &'static str {
+    match level {
         LogLevel::Emergency => "EMERGENCY",
-        LogLevel::Alert => "   ALERT",
-        LogLevel::Critical => "CRITICAL",
-        LogLevel::Error => "   ERROR",
-        LogLevel::Warning => "    WARN",
-        LogLevel::Notice => "  NOTICE",
-        LogLevel::Info => "    INFO",
-        LogLevel::Debug => "   DEBUG",
-        LogLevel::Unknown => " UNKNOWN",
+        LogLevel::Alert => "    ALERT",
+        LogLevel::Critical => " CRITICAL",
+        LogLevel::Error => "    ERROR",
+        LogLevel::Warning => "     WARN",
+        LogLevel::Notice => "   NOTICE",
+        LogLevel::Info => "     INFO",
+        LogLevel::Debug => "    DEBUG",
+        LogLevel::Unknown => "  UNKNOWN",
+    }
+}
+
+fn extract_time(timestamp: &str) -> &str {
+    if timestamp.len() >= 19 {
+        &timestamp[11..19]
+    } else if timestamp.len() >= 8 {
+        &timestamp[..8]
+    } else {
+        timestamp
+    }
+}
+
+fn build_collapsed_line(
+    entry: &ParsedLogEntry,
+    is_selected: bool,
+    available_width: u16,
+) -> Line<'static> {
+    let color = level_color(&entry.level);
+    let time = extract_time(&entry.timestamp);
+    let level = level_text(&entry.level);
+
+    let mut spans = Vec::new();
+
+    if is_selected {
+        spans.push(Span::styled("▌ ", Style::default().fg(Theme::ACCENT)));
+    } else {
+        spans.push(Span::raw("  "));
+    }
+
+    spans.push(Span::styled(
+        time.to_string(),
+        Style::default().fg(Theme::TEXT_MUTED),
+    ));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        level.to_string(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw(" "));
+
+    // Right-side indicators
+    let mut right_indicators = String::new();
+    if entry.payload.is_some() || entry.context.is_some() {
+        right_indicators.push_str(" {…}");
+    }
+    let frame_count = entry.frame_count();
+    if frame_count > 0 {
+        if !right_indicators.is_empty() {
+            right_indicators.push(' ');
+        }
+        right_indicators.push_str(&format!(" ▶ {} frames", frame_count));
+    }
+
+    // Calculate how much space is left for the message
+    // 2 (selector) + 8 (time) + 1 (space) + 9 (level) + 1 (space) = 21 prefix chars
+    let prefix_len: u16 = 21;
+    let right_len = right_indicators.len() as u16;
+    let msg_width = (available_width)
+        .saturating_sub(prefix_len)
+        .saturating_sub(right_len) as usize;
+
+    let message: String = if entry.message.len() > msg_width && msg_width > 3 {
+        format!("{}...", &entry.message[..msg_width.saturating_sub(3)])
+    } else {
+        entry.message.clone()
     };
 
-    let (timestamp, message) = extract_timestamp_and_message(&log_line.content);
+    // Pad message to fill available space
+    let padded_message = format!("{:<width$}", message, width = msg_width);
+    spans.push(Span::styled(padded_message, Style::default().fg(Theme::TEXT)));
 
-    let spans = vec![
-        Span::styled(timestamp, Style::default().fg(Theme::TEXT_MUTED)),
-        Span::raw("  "),
-        Span::styled(
-            level_text,
-            Style::default()
-                .fg(level_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(message, Style::default().fg(Theme::TEXT)),
-    ];
+    if !right_indicators.is_empty() {
+        spans.push(Span::styled(
+            right_indicators,
+            Style::default().fg(Theme::TEXT_MUTED),
+        ));
+    }
 
     Line::from(spans)
 }
 
-/// Extract timestamp and message from Laravel log line
-fn extract_timestamp_and_message(content: &str) -> (String, String) {
-    if content.starts_with('[') {
-        if let Some(end_bracket) = content.find(']') {
-            let timestamp = &content[1..end_bracket];
-            let rest = &content[end_bracket + 1..];
-            if let Some(colon_pos) = rest.find(':') {
-                let message = rest[colon_pos + 1..].trim();
-                return (timestamp.to_string(), message.to_string());
+fn build_expanded_lines(
+    entry: &ParsedLogEntry,
+    available_width: u16,
+) -> Vec<Line<'static>> {
+    let color = level_color(&entry.level);
+    let mut lines = Vec::new();
+
+    let has_payload = entry.payload.is_some();
+    let has_context = entry.context.is_some();
+    let has_both = has_payload && has_context;
+
+    if let Some(ref payload_str) = entry.payload {
+        if has_both {
+            lines.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(color)),
+                Span::styled(
+                    build_section_divider("Payload", available_width.saturating_sub(4) as usize),
+                    Style::default().fg(Theme::TEXT_MUTED),
+                ),
+            ]));
+        }
+        render_json_lines(&mut lines, payload_str, color, available_width);
+    }
+
+    if let Some(ref context_str) = entry.context {
+        if has_both {
+            lines.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(color)),
+                Span::styled(
+                    build_section_divider("Context", available_width.saturating_sub(4) as usize),
+                    Style::default().fg(Theme::TEXT_MUTED),
+                ),
+            ]));
+        }
+        render_json_lines(&mut lines, context_str, color, available_width);
+    }
+
+    if let Some(ref stacktrace) = entry.stacktrace {
+        if !stacktrace.exception_summary.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("│   ", Style::default().fg(color)),
+                Span::styled(
+                    stacktrace.exception_summary.clone(),
+                    Style::default().fg(Theme::TEXT),
+                ),
+            ]));
+        }
+
+        if !stacktrace.frames.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("│", Style::default().fg(color)),
+            ]));
+            for frame_line in &stacktrace.frames {
+                lines.push(Line::from(vec![
+                    Span::styled("│   ", Style::default().fg(color)),
+                    Span::styled(frame_line.clone(), Style::default().fg(Theme::TEXT_DIM)),
+                ]));
             }
-            return (timestamp.to_string(), rest.trim().to_string());
         }
     }
-    ("                   ".to_string(), content.to_string())
+
+    lines
 }
 
-pub fn render(frame: &mut Frame, area: Rect, app: &App) {
-    // Get filtered logs
-    let filtered_logs = app.filtered_logs();
-    let lines: Vec<Line> = filtered_logs
-        .iter()
-        .map(|log| format_log_line(log))
-        .collect();
+fn build_section_divider(label: &str, width: usize) -> String {
+    let prefix = format!("┄ {} ┄", label);
+    let remaining = width.saturating_sub(prefix.len());
+    format!("{}{}", prefix, "┄".repeat(remaining))
+}
 
-    // Calculate visible area height
-    let inner_height = area.height.saturating_sub(5) as usize; // Account for borders, header, footer
-    let total_lines = lines.len();
-
-    // Calculate scroll position
-    let scroll = if app.logs_tab.scroll_offset == 0 {
-        total_lines.saturating_sub(inner_height) as u16
+fn render_json_lines(
+    lines: &mut Vec<Line<'static>>,
+    json_str: &str,
+    connector_color: Color,
+    _available_width: u16,
+) {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(json_str)
+    {
+        for (key, value) in &map {
+            let value_span = format_json_value(value);
+            lines.push(Line::from(vec![
+                Span::styled("│   ", Style::default().fg(connector_color)),
+                Span::styled(
+                    format!("{}: ", key),
+                    Style::default().fg(Theme::ACCENT),
+                ),
+                value_span,
+            ]));
+        }
     } else {
-        total_lines
-            .saturating_sub(inner_height)
-            .saturating_sub(app.logs_tab.scroll_offset) as u16
-    };
+        lines.push(Line::from(vec![
+            Span::styled("│   ", Style::default().fg(connector_color)),
+            Span::styled(json_str.to_string(), Style::default().fg(Theme::TEXT)),
+        ]));
+    }
+}
 
-    // Build title with filter info
-    let filter_info = app.logs_tab.filter_name();
-    let file_info = app.logs_tab.file_name();
+fn format_json_value(value: &serde_json::Value) -> Span<'static> {
+    match value {
+        serde_json::Value::String(s) => Span::styled(
+            format!("\"{}\"", s),
+            Style::default().fg(Theme::TEXT),
+        ),
+        serde_json::Value::Number(n) => Span::styled(
+            n.to_string(),
+            Style::default().fg(Theme::LOG_NOTICE),
+        ),
+        serde_json::Value::Bool(b) => Span::styled(
+            b.to_string(),
+            Style::default().fg(Theme::LOG_NOTICE),
+        ),
+        serde_json::Value::Null => Span::styled(
+            "null".to_string(),
+            Style::default().fg(Theme::TEXT_MUTED),
+        ),
+        other => Span::styled(
+            other.to_string(),
+            Style::default().fg(Theme::TEXT),
+        ),
+    }
+}
+
+fn render_entries(frame: &mut Frame, area: Rect, app: &App) {
+    let is_focused = app.logs_tab.focus == LogsPaneFocus::Entries;
+
+    let filtered_indices = app.logs_tab.filtered_entry_indices();
+    let entry_count = filtered_indices.len();
+
+    let mode_indicator = app
+        .logs_tab
+        .view_mode
+        .unwrap_or(LogViewMode::Live)
+        .indicator();
+    let filter_name = app.logs_tab.filter_name();
     let title = format!(
-        " Logs [{}] File: {} | Level: {} ",
-        filtered_logs.len(),
-        file_info,
-        filter_info
+        " Logs [{}] {} | Level: {} ",
+        entry_count, mode_indicator, filter_name
     );
 
-    let block = Block::default()
-        .title(title)
-        .title_style(Theme::title_style())
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Theme::BORDER_FOCUSED))
-        .padding(Padding::horizontal(1));
-
-    // Render search bar if in input mode
-    if app.logs_tab.input_mode {
-        render_with_search(
-            frame,
-            area,
-            app,
-            lines,
-            block,
-            scroll,
-            total_lines,
-            inner_height,
-        );
+    let block = if is_focused {
+        Theme::focused_block(&title)
     } else {
-        let paragraph = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0));
+        Theme::default_block(&title)
+    }
+    .padding(Padding::horizontal(1));
 
-        frame.render_widget(paragraph, area);
+    // Account for borders (2) + padding (2) + search bar (1) + footer (1) = 6
+    let inner_height = area.height.saturating_sub(6) as usize;
+    let content_width = area.width.saturating_sub(6); // borders + padding + scrollbar
 
-        // Render scrollbar if content overflows
-        if total_lines > inner_height {
-            render_scrollbar(frame, area, total_lines, inner_height, scroll);
+    // Build all visible lines with entry-to-line mapping
+    let mut all_lines: Vec<Line<'static>> = Vec::new();
+    let mut selected_line_start: usize = 0;
+    let mut selected_line_count: usize = 1;
+
+    for &entry_idx in &filtered_indices {
+        if let Some(entry) = app.logs_tab.entries.get(entry_idx) {
+            let is_selected = entry_idx == app.logs_tab.selected_entry;
+            let is_expanded = app.logs_tab.expanded_entries.contains(&entry_idx);
+
+            if is_selected {
+                selected_line_start = all_lines.len();
+            }
+
+            let mut header = build_collapsed_line(entry, is_selected, content_width);
+            if is_selected {
+                header = header.style(Style::default().bg(Theme::SELECTION_BG));
+            }
+            all_lines.push(header);
+
+            if is_expanded {
+                let expanded = build_expanded_lines(entry, content_width);
+                let expanded_count = expanded.len();
+                for mut line in expanded {
+                    if is_selected {
+                        line = line.style(Style::default().bg(Theme::SELECTION_BG));
+                    }
+                    all_lines.push(line);
+                }
+                if is_selected {
+                    selected_line_count = 1 + expanded_count;
+                }
+            } else if is_selected {
+                selected_line_count = 1;
+            }
         }
     }
 
-    // Render search hint or current search query
+    let total_lines = all_lines.len();
+
+    // Calculate scroll so the selected entry is visible
+    let scroll = if total_lines <= inner_height {
+        0u16
+    } else {
+        let selected_end = selected_line_start + selected_line_count;
+        let current_scroll = app.logs_tab.scroll_offset;
+
+        if selected_line_start < current_scroll {
+            selected_line_start as u16
+        } else if selected_end > current_scroll + inner_height {
+            (selected_end.saturating_sub(inner_height)) as u16
+        } else {
+            current_scroll as u16
+        }
+    };
+
+    let paragraph = Paragraph::new(all_lines)
+        .block(block)
+        .scroll((scroll, 0));
+
+    frame.render_widget(paragraph, area);
+
+    // Render scrollbar if content overflows
+    if total_lines > inner_height {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .thumb_style(Style::default().fg(Theme::SCROLLBAR_THUMB))
+            .track_style(Style::default().fg(Theme::SCROLLBAR_TRACK));
+
+        let max_scroll = total_lines.saturating_sub(inner_height);
+        let mut scrollbar_state = ScrollbarState::new(max_scroll).position(scroll as usize);
+
+        let scrollbar_area = Rect {
+            x: area.x + area.width.saturating_sub(2),
+            y: area.y + 1,
+            width: 1,
+            height: area.height.saturating_sub(4),
+        };
+
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
+
+    // Search bar
     let search_area = Rect {
         x: area.x + 2,
         y: area.y + 1,
@@ -159,15 +383,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(" (press / to edit)", Style::default().fg(Theme::TEXT_MUTED)),
         ])
     } else {
-        Line::from(vec![Span::styled(
-            "Press / to search",
-            Style::default().fg(Theme::TEXT_MUTED),
-        )])
+        Line::from(vec![])
     };
 
-    frame.render_widget(Paragraph::new(search_line), search_area);
+    if !search_line.spans.is_empty() {
+        frame.render_widget(Paragraph::new(search_line), search_area);
+    }
 
-    // Footer with actions
+    // Footer
     let footer_area = Rect {
         x: area.x + 2,
         y: area.y + area.height.saturating_sub(2),
@@ -176,79 +399,38 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let footer = if app.logs_tab.input_mode {
-        Paragraph::new(Line::from(vec![
+        Line::from(vec![
             Span::styled("[Esc] ", Style::default().fg(Theme::ACCENT)),
             Span::styled("Cancel", Style::default().fg(Theme::TEXT_DIM)),
             Span::raw("  "),
             Span::styled("[Enter] ", Style::default().fg(Theme::ACCENT)),
             Span::styled("Confirm", Style::default().fg(Theme::TEXT_DIM)),
-        ]))
-    } else {
-        Paragraph::new(Line::from(vec![
+        ])
+    } else if is_focused {
+        Line::from(vec![
+            Span::styled("[j/k] ", Style::default().fg(Theme::ACCENT)),
+            Span::styled("Navigate", Style::default().fg(Theme::TEXT_DIM)),
+            Span::raw("  "),
+            Span::styled("[Enter] ", Style::default().fg(Theme::ACCENT)),
+            Span::styled("Expand", Style::default().fg(Theme::TEXT_DIM)),
+            Span::raw("  "),
+            Span::styled("[e/E] ", Style::default().fg(Theme::ACCENT)),
+            Span::styled("Expand/Collapse All", Style::default().fg(Theme::TEXT_DIM)),
+            Span::raw("  "),
             Span::styled("[/] ", Style::default().fg(Theme::ACCENT)),
             Span::styled("Search", Style::default().fg(Theme::TEXT_DIM)),
             Span::raw("  "),
             Span::styled("[f] ", Style::default().fg(Theme::ACCENT)),
             Span::styled("Level", Style::default().fg(Theme::TEXT_DIM)),
             Span::raw("  "),
-            Span::styled("[F] ", Style::default().fg(Theme::ACCENT)),
-            Span::styled("File", Style::default().fg(Theme::TEXT_DIM)),
-            Span::raw("  "),
-            Span::styled("[c] ", Style::default().fg(Theme::ACCENT)),
-            Span::styled("Clear", Style::default().fg(Theme::TEXT_DIM)),
-            Span::raw("  "),
             Span::styled("[g/G] ", Style::default().fg(Theme::ACCENT)),
             Span::styled("Top/Bottom", Style::default().fg(Theme::TEXT_DIM)),
-        ]))
+        ])
+    } else {
+        Line::from(vec![])
     };
-    frame.render_widget(footer, footer_area);
-}
 
-#[allow(clippy::too_many_arguments)]
-fn render_with_search(
-    frame: &mut Frame,
-    area: Rect,
-    _app: &App,
-    lines: Vec<Line>,
-    block: Block,
-    scroll: u16,
-    total_lines: usize,
-    inner_height: usize,
-) {
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-
-    frame.render_widget(paragraph, area);
-
-    if total_lines > inner_height {
-        render_scrollbar(frame, area, total_lines, inner_height, scroll);
+    if !footer.spans.is_empty() {
+        frame.render_widget(Paragraph::new(footer), footer_area);
     }
-}
-
-fn render_scrollbar(
-    frame: &mut Frame,
-    area: Rect,
-    total_lines: usize,
-    inner_height: usize,
-    scroll: u16,
-) {
-    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-        .begin_symbol(None)
-        .end_symbol(None)
-        .thumb_style(Style::default().fg(Theme::SCROLLBAR_THUMB))
-        .track_style(Style::default().fg(Theme::SCROLLBAR_TRACK));
-
-    let mut scrollbar_state =
-        ScrollbarState::new(total_lines.saturating_sub(inner_height)).position(scroll as usize);
-
-    let scrollbar_area = Rect {
-        x: area.x + area.width.saturating_sub(2),
-        y: area.y + 1,
-        width: 1,
-        height: area.height.saturating_sub(4),
-    };
-
-    frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
 }
