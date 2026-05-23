@@ -111,7 +111,10 @@ fn build_collapsed_line(
 
     // Pad message to fill available space
     let padded_message = format!("{:<width$}", message, width = msg_width);
-    spans.push(Span::styled(padded_message, Style::default().fg(Theme::TEXT)));
+    spans.push(Span::styled(
+        padded_message,
+        Style::default().fg(Theme::TEXT),
+    ));
 
     if !right_indicators.is_empty() {
         spans.push(Span::styled(
@@ -123,10 +126,7 @@ fn build_collapsed_line(
     Line::from(spans)
 }
 
-fn build_expanded_lines(
-    entry: &ParsedLogEntry,
-    available_width: u16,
-) -> Vec<Line<'static>> {
+fn build_expanded_lines(entry: &ParsedLogEntry, available_width: u16) -> Vec<Line<'static>> {
     let color = level_color(&entry.level);
     let mut lines = Vec::new();
 
@@ -172,9 +172,10 @@ fn build_expanded_lines(
         }
 
         if !stacktrace.frames.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("│", Style::default().fg(color)),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                "│",
+                Style::default().fg(color),
+            )]));
             for frame_line in &stacktrace.frames {
                 lines.push(Line::from(vec![
                     Span::styled("│   ", Style::default().fg(color)),
@@ -205,10 +206,7 @@ fn render_json_lines(
             let value_span = format_json_value(value);
             lines.push(Line::from(vec![
                 Span::styled("│   ", Style::default().fg(connector_color)),
-                Span::styled(
-                    format!("{}: ", key),
-                    Style::default().fg(Theme::ACCENT),
-                ),
+                Span::styled(format!("{}: ", key), Style::default().fg(Theme::ACCENT)),
                 value_span,
             ]));
         }
@@ -222,26 +220,19 @@ fn render_json_lines(
 
 fn format_json_value(value: &serde_json::Value) -> Span<'static> {
     match value {
-        serde_json::Value::String(s) => Span::styled(
-            format!("\"{}\"", s),
-            Style::default().fg(Theme::TEXT),
-        ),
-        serde_json::Value::Number(n) => Span::styled(
-            n.to_string(),
-            Style::default().fg(Theme::LOG_NOTICE),
-        ),
-        serde_json::Value::Bool(b) => Span::styled(
-            b.to_string(),
-            Style::default().fg(Theme::LOG_NOTICE),
-        ),
-        serde_json::Value::Null => Span::styled(
-            "null".to_string(),
-            Style::default().fg(Theme::TEXT_MUTED),
-        ),
-        other => Span::styled(
-            other.to_string(),
-            Style::default().fg(Theme::TEXT),
-        ),
+        serde_json::Value::String(s) => {
+            Span::styled(format!("\"{}\"", s), Style::default().fg(Theme::TEXT))
+        }
+        serde_json::Value::Number(n) => {
+            Span::styled(n.to_string(), Style::default().fg(Theme::LOG_NOTICE))
+        }
+        serde_json::Value::Bool(b) => {
+            Span::styled(b.to_string(), Style::default().fg(Theme::LOG_NOTICE))
+        }
+        serde_json::Value::Null => {
+            Span::styled("null".to_string(), Style::default().fg(Theme::TEXT_MUTED))
+        }
+        other => Span::styled(other.to_string(), Style::default().fg(Theme::TEXT)),
     }
 }
 
@@ -329,9 +320,7 @@ fn render_entries(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
 
-    let paragraph = Paragraph::new(all_lines)
-        .block(block)
-        .scroll((scroll, 0));
+    let paragraph = Paragraph::new(all_lines).block(block).scroll((scroll, 0));
 
     frame.render_widget(paragraph, area);
 
