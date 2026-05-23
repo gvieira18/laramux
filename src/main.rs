@@ -422,9 +422,7 @@ async fn run(working_dir: PathBuf, pid_registry: process::PidRegistry) -> Result
                     }
                 }
                 Event::LogUpdate(lines) => {
-                    app.add_log_lines(lines.clone());
-
-                    // Also parse into structured entries for the new log viewer
+                    // Parse raw log lines into structured entries for the log viewer
                     if app.logs_tab.active_file.as_deref() == Some("laravel.log")
                         || app.logs_tab.active_file.is_none()
                     {

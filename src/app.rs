@@ -13,9 +13,6 @@ use crate::process::types::{
 use crate::process::{FullArtisanCommand, QualityTool};
 use crate::ui::tabs::Tab;
 
-/// Default maximum number of log entries to keep
-pub const DEFAULT_MAX_LOG_LINES: usize = 1000;
-
 /// System resource statistics
 #[derive(Debug, Clone, Default)]
 pub struct SystemStats {
@@ -38,17 +35,6 @@ pub struct ProcessStats {
     pub cpu_usage: f32,
     /// Memory usage in bytes for this process
     pub memory_bytes: u64,
-}
-
-/// A line from a log file.
-///
-/// **Deprecated**: Use `ParsedLogEntry` from `crate::log::entry` instead.
-/// This struct will be removed in Task 7.
-#[derive(Debug, Clone)]
-pub struct LogLine {
-    pub content: String,
-    pub level: LogLevel,
-    pub file: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,12 +319,6 @@ pub struct LogsTabState {
     pub input_mode: bool,
     /// Which pane has focus
     pub focus: LogsPaneFocus,
-
-    // Legacy fields for backward compatibility during transition
-    /// Selected file (legacy, use active_file instead)
-    pub selected_file: Option<String>,
-    /// Available files (legacy, use file_tree instead)
-    pub available_files: Vec<String>,
 }
 
 impl Default for LogsTabState {
@@ -362,8 +342,6 @@ impl LogsTabState {
             filter_level: None,
             input_mode: false,
             focus: LogsPaneFocus::default(),
-            selected_file: None,
-            available_files: Vec::new(),
         }
     }
 
@@ -541,40 +519,6 @@ impl LogsTabState {
             })
             .map(|(i, _)| i)
             .collect()
-    }
-
-    // ---- Legacy compatibility methods ----
-
-    /// Cycle through available files (legacy)
-    pub fn cycle_file(&mut self) {
-        if self.available_files.is_empty() {
-            return;
-        }
-
-        self.selected_file = match &self.selected_file {
-            None => Some(self.available_files[0].clone()),
-            Some(current) => {
-                let current_idx = self
-                    .available_files
-                    .iter()
-                    .position(|f| f == current)
-                    .unwrap_or(0);
-                let next_idx = current_idx + 1;
-                if next_idx >= self.available_files.len() {
-                    None // Back to "All"
-                } else {
-                    Some(self.available_files[next_idx].clone())
-                }
-            }
-        };
-    }
-
-    /// Get display name for the selected file (legacy)
-    pub fn file_name(&self) -> &str {
-        match &self.selected_file {
-            None => "All",
-            Some(file) => file,
-        }
     }
 }
 
@@ -1543,9 +1487,6 @@ pub struct App {
     /// Order of processes for display
     pub process_order: Vec<ProcessId>,
 
-    /// Laravel log lines (legacy — will be removed in Task 7)
-    pub log_lines: VecDeque<LogLine>,
-
     /// Working directory (Laravel project root)
     pub working_dir: PathBuf,
 
@@ -1581,7 +1522,6 @@ impl App {
             config_tab: ConfigTabState::default(),
             processes: HashMap::new(),
             process_order: Vec::new(),
-            log_lines: VecDeque::with_capacity(DEFAULT_MAX_LOG_LINES),
             working_dir,
             should_quit: false,
             status_message: None,
@@ -1710,96 +1650,8 @@ impl App {
         }
     }
 
-    /// Add log lines from Laravel log
-    pub fn add_log_lines(&mut self, entries: Vec<crate::log::RawLogEntry>) {
-        let max = self.logs_tab.max_entries;
-        for entry in entries {
-            // Track available files (legacy)
-            if !self.logs_tab.available_files.contains(&entry.file) {
-                self.logs_tab.available_files.push(entry.file.clone());
-                self.logs_tab.available_files.sort();
-            }
-
-            let level = Self::parse_log_level(&entry.content);
-            let log_line = LogLine {
-                content: entry.content,
-                level,
-                file: entry.file,
-            };
-
-            if self.log_lines.len() >= max {
-                self.log_lines.pop_front();
-            }
-            self.log_lines.push_back(log_line);
-        }
-    }
-
-    /// Parse log level from a Laravel log line
-    fn parse_log_level(line: &str) -> LogLevel {
-        // Laravel log format: [YYYY-MM-DD HH:MM:SS] environment.LEVEL: message
-        // Example: [2024-01-26 10:30:45] local.INFO: Test message
-        if let Some(bracket_end) = line.find("] ") {
-            let after_bracket = &line[bracket_end + 2..];
-            if let Some(colon_pos) = after_bracket.find(':') {
-                let env_level = &after_bracket[..colon_pos];
-                if let Some(dot_pos) = env_level.rfind('.') {
-                    return LogLevel::from_str(&env_level[dot_pos + 1..]);
-                }
-            }
-        }
-        LogLevel::Unknown
-    }
-
-    /// Get filtered log lines based on search query, filter level, and selected file
-    pub fn filtered_logs(&self) -> Vec<&LogLine> {
-        self.log_lines
-            .iter()
-            .filter(|log| {
-                // Filter by file
-                if let Some(selected_file) = &self.logs_tab.selected_file {
-                    if &log.file != selected_file {
-                        return false;
-                    }
-                }
-
-                // Filter by level (Unknown logs always pass the level filter)
-                if let Some(min_level) = self.logs_tab.filter_level {
-                    if log.level != LogLevel::Unknown {
-                        let level_order = |l: &LogLevel| -> u8 {
-                            match l {
-                                LogLevel::Debug => 0,
-                                LogLevel::Info => 1,
-                                LogLevel::Notice => 2,
-                                LogLevel::Warning => 3,
-                                LogLevel::Error => 4,
-                                LogLevel::Critical => 5,
-                                LogLevel::Alert => 6,
-                                LogLevel::Emergency => 7,
-                                LogLevel::Unknown => 0,
-                            }
-                        };
-                        if level_order(&log.level) < level_order(&min_level) {
-                            return false;
-                        }
-                    }
-                }
-
-                // Filter by search query
-                if !self.logs_tab.search_query.is_empty() {
-                    let query = self.logs_tab.search_query.to_lowercase();
-                    if !log.content.to_lowercase().contains(&query) {
-                        return false;
-                    }
-                }
-
-                true
-            })
-            .collect()
-    }
-
-    /// Clear all log lines
+    /// Clear all log entries
     pub fn clear_logs(&mut self) {
-        self.log_lines.clear();
         self.logs_tab.entries.clear();
         self.logs_tab.expanded_entries.clear();
         self.logs_tab.selected_entry = 0;
@@ -1840,16 +1692,6 @@ impl App {
         if let Some(process) = self.selected_process_mut() {
             process.scroll_offset = process.scroll_offset.saturating_sub(amount);
         }
-    }
-
-    /// Scroll log pane up
-    pub fn scroll_log_up(&mut self, amount: usize) {
-        self.logs_tab.scroll_offset = self.logs_tab.scroll_offset.saturating_add(amount);
-    }
-
-    /// Scroll log pane down
-    pub fn scroll_log_down(&mut self, amount: usize) {
-        self.logs_tab.scroll_offset = self.logs_tab.scroll_offset.saturating_sub(amount);
     }
 
     // Tab navigation

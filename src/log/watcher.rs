@@ -11,11 +11,10 @@ use crate::error::Result;
 use crate::event::Event;
 use crate::log::entry::LogEntryParser;
 
-/// A log line with its source file
+/// A raw log line from a watched file
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub content: String,
-    pub file: String,
 }
 
 /// Watch Laravel log directory for changes
@@ -119,17 +118,12 @@ impl LogWatcher {
         // Only tail-follow laravel.log (not all .log files)
         let laravel_log = log_dir.join("laravel.log");
         if laravel_log.exists() {
-            let file_name = "laravel.log".to_string();
-
             // Read last 5 lines as initial history
             if let Ok(recent_lines) = read_last_n_lines(&laravel_log, 5) {
                 if !recent_lines.is_empty() {
                     let entries: Vec<LogEntry> = recent_lines
                         .into_iter()
-                        .map(|content| LogEntry {
-                            content,
-                            file: file_name.clone(),
-                        })
+                        .map(|content| LogEntry { content })
                         .collect();
                     let _ = event_tx.send(Event::LogUpdate(entries)).await;
                 }
@@ -144,21 +138,12 @@ impl LogWatcher {
         // Initialize positions for additional files
         for file in &additional_files {
             if file.exists() {
-                let file_name = file
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
                 // Read last 5 lines as initial history
                 if let Ok(recent_lines) = read_last_n_lines(file, 5) {
                     if !recent_lines.is_empty() {
                         let entries: Vec<LogEntry> = recent_lines
                             .into_iter()
-                            .map(|content| LogEntry {
-                                content,
-                                file: file_name.clone(),
-                            })
+                            .map(|content| LogEntry { content })
                             .collect();
                         let _ = event_tx.send(Event::LogUpdate(entries)).await;
                     }
@@ -210,12 +195,6 @@ impl LogWatcher {
                                     notify::EventKind::Modify(_) | notify::EventKind::Create(_)
                                 )
                             {
-                                let file_name = path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
-
                                 // Get or create position tracker for this file
                                 let last_pos = file_positions.entry(path.clone()).or_insert(0);
 
@@ -224,10 +203,7 @@ impl LogWatcher {
                                     if !new_lines.is_empty() {
                                         let entries: Vec<LogEntry> = new_lines
                                             .into_iter()
-                                            .map(|content| LogEntry {
-                                                content,
-                                                file: file_name.clone(),
-                                            })
+                                            .map(|content| LogEntry { content })
                                             .collect();
                                         let _ = event_tx.send(Event::LogUpdate(entries)).await;
                                     }
@@ -310,7 +286,6 @@ pub fn find_log_dir(working_dir: &std::path::Path) -> Option<PathBuf> {
 /// Returns `(entries, skipped)` where `skipped` is the number of entries
 /// that were parsed but dropped because they exceeded `max_entries`.
 /// This is called synchronously (intended to run inside `spawn_blocking`).
-#[allow(dead_code)] // Will be used by Task 6 (event loop wiring)
 pub fn read_static_file(
     path: &Path,
     max_entries: usize,

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::app::LogLevel;
 
 #[derive(Debug, Clone)]
@@ -11,12 +9,14 @@ pub struct Stacktrace {
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub timestamp: String,
+    #[allow(dead_code)] // Populated by parser, not yet consumed by UI
     pub environment: String,
     pub level: LogLevel,
     pub message: String,
     pub payload: Option<String>,
     pub context: Option<String>,
     pub stacktrace: Option<Stacktrace>,
+    #[allow(dead_code)] // Populated by parser, not yet consumed by UI
     pub raw: String,
 }
 
