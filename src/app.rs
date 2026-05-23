@@ -1,18 +1,20 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crate::config::LaramuxConfig;
+use crate::log::entry::LogEntry as ParsedLogEntry;
 use crate::process::types::{
     OutputLine, Process, ProcessConfig, ProcessId, ProcessRegistry, ProcessStatus,
 };
 use crate::process::{FullArtisanCommand, QualityTool};
 use crate::ui::tabs::Tab;
 
-/// Default maximum number of log lines to display
-pub const DEFAULT_MAX_LOG_LINES: usize = 100;
+/// Default maximum number of log entries to keep
+pub const DEFAULT_MAX_LOG_LINES: usize = 1000;
 
 /// System resource statistics
 #[derive(Debug, Clone, Default)]
@@ -38,7 +40,10 @@ pub struct ProcessStats {
     pub memory_bytes: u64,
 }
 
-/// A line from a log file
+/// A line from a log file.
+///
+/// **Deprecated**: Use `ParsedLogEntry` from `crate::log::entry` instead.
+/// This struct will be removed in Task 7.
 #[derive(Debug, Clone)]
 pub struct LogLine {
     pub content: String,
@@ -161,18 +166,317 @@ impl ProcessesTabState {
 // Logs Tab State
 // ============================================================================
 
-/// State for the Logs tab
+/// Which pane has focus in the logs tab
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogsPaneFocus {
+    FileTree,
+    #[default]
+    Entries,
+}
+
+/// View mode for a log file
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogViewMode {
+    /// Live-tailing mode (only for laravel.log)
+    Live,
+    /// Static file viewing mode (all other files)
+    Static,
+}
+
+impl LogViewMode {
+    /// Determine the view mode for a given filename
+    pub fn for_file(filename: &str) -> Self {
+        if filename == "laravel.log" {
+            LogViewMode::Live
+        } else {
+            LogViewMode::Static
+        }
+    }
+
+    /// Display indicator for the view mode
+    pub fn indicator(&self) -> &'static str {
+        match self {
+            LogViewMode::Live => "⏺ LIVE",
+            LogViewMode::Static => "⏸ STATIC",
+        }
+    }
+}
+
+/// Extract YYYY-MM-DD date from a log filename like `auth-2026-05-22.log`
+pub fn extract_date_from_filename(filename: &str) -> Option<&str> {
+    let name = filename.strip_suffix(".log").unwrap_or(filename);
+    // Look for a YYYY-MM-DD pattern anywhere in the filename
+    let bytes = name.as_bytes();
+    if bytes.len() < 10 {
+        return None;
+    }
+    for i in 0..=bytes.len() - 10 {
+        if bytes[i].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3].is_ascii_digit()
+            && bytes[i + 4] == b'-'
+            && bytes[i + 5].is_ascii_digit()
+            && bytes[i + 6].is_ascii_digit()
+            && bytes[i + 7] == b'-'
+            && bytes[i + 8].is_ascii_digit()
+            && bytes[i + 9].is_ascii_digit()
+        {
+            return Some(&name[i..i + 10]);
+        }
+    }
+    None
+}
+
+/// Flat sorted list of log files
 #[derive(Debug, Default)]
+pub struct LogFileTree {
+    pub files: Vec<String>,
+    pub selected_index: usize,
+}
+
+impl LogFileTree {
+    pub fn new() -> Self {
+        Self {
+            files: Vec::new(),
+            selected_index: 0,
+        }
+    }
+
+    /// Update the file list with proper sorting:
+    /// 1. `laravel.log` always first
+    /// 2. Files with dates sorted descending (most recent first)
+    /// 3. Files without dates sorted alphabetically
+    pub fn update_files(&mut self, mut files: Vec<String>) {
+        files.sort_by(|a, b| {
+            let a_is_laravel = a == "laravel.log";
+            let b_is_laravel = b == "laravel.log";
+
+            if a_is_laravel && !b_is_laravel {
+                return std::cmp::Ordering::Less;
+            }
+            if !a_is_laravel && b_is_laravel {
+                return std::cmp::Ordering::Greater;
+            }
+            if a_is_laravel && b_is_laravel {
+                return std::cmp::Ordering::Equal;
+            }
+
+            let date_a = extract_date_from_filename(a);
+            let date_b = extract_date_from_filename(b);
+
+            match (date_a, date_b) {
+                (Some(da), Some(db)) => {
+                    // Descending by date, then alphabetical for same date
+                    match db.cmp(da) {
+                        std::cmp::Ordering::Equal => a.cmp(b),
+                        ord => ord,
+                    }
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.cmp(b),
+            }
+        });
+
+        self.files = files;
+
+        if self.selected_index >= self.files.len() {
+            self.selected_index = 0;
+        }
+    }
+
+    /// Get the currently selected filename
+    pub fn selected_file(&self) -> Option<&str> {
+        self.files.get(self.selected_index).map(|s| s.as_str())
+    }
+
+    /// Move selection to the next file
+    pub fn select_next(&mut self) {
+        if !self.files.is_empty() && self.selected_index < self.files.len() - 1 {
+            self.selected_index += 1;
+        }
+    }
+
+    /// Move selection to the previous file
+    pub fn select_previous(&mut self) {
+        if self.selected_index > 0 {
+            self.selected_index -= 1;
+        }
+    }
+}
+
+/// State for the Logs tab
+#[derive(Debug)]
 pub struct LogsTabState {
-    pub search_query: String,
-    pub filter_level: Option<LogLevel>,
+    /// File tree for log file navigation
+    pub file_tree: LogFileTree,
+    /// Currently active log file
+    pub active_file: Option<String>,
+    /// View mode for the active file
+    pub view_mode: Option<LogViewMode>,
+    /// Parsed log entries for the active file
+    pub entries: VecDeque<ParsedLogEntry>,
+    /// Maximum number of entries to keep
+    pub max_entries: usize,
+    /// Currently selected entry index
+    pub selected_entry: usize,
+    /// Set of expanded entry indices
+    pub expanded_entries: HashSet<usize>,
+    /// Scroll offset for the entries pane
     pub scroll_offset: usize,
+    /// Search query text
+    pub search_query: String,
+    /// Log level filter
+    pub filter_level: Option<LogLevel>,
+    /// Whether search input mode is active
     pub input_mode: bool,
+    /// Which pane has focus
+    pub focus: LogsPaneFocus,
+
+    // Legacy fields for backward compatibility during transition
+    /// Selected file (legacy, use active_file instead)
     pub selected_file: Option<String>,
+    /// Available files (legacy, use file_tree instead)
     pub available_files: Vec<String>,
 }
 
+impl Default for LogsTabState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogsTabState {
+    pub fn new() -> Self {
+        Self {
+            file_tree: LogFileTree::new(),
+            active_file: None,
+            view_mode: None,
+            entries: VecDeque::with_capacity(1000),
+            max_entries: 1000,
+            selected_entry: 0,
+            expanded_entries: HashSet::new(),
+            scroll_offset: 0,
+            search_query: String::new(),
+            filter_level: None,
+            input_mode: false,
+            focus: LogsPaneFocus::default(),
+            selected_file: None,
+            available_files: Vec::new(),
+        }
+    }
+
+    /// Add a parsed log entry, respecting max_entries limit.
+    /// When an entry is popped from the front, adjusts expanded_entries indices
+    /// and selected_entry accordingly.
+    pub fn add_entry(&mut self, entry: ParsedLogEntry) {
+        if self.entries.len() >= self.max_entries {
+            self.entries.pop_front();
+
+            // Shift all expanded indices down by 1, removing index 0
+            self.expanded_entries = self
+                .expanded_entries
+                .iter()
+                .filter_map(|&idx| if idx > 0 { Some(idx - 1) } else { None })
+                .collect();
+
+            // Adjust selected_entry
+            self.selected_entry = self.selected_entry.saturating_sub(1);
+        }
+        self.entries.push_back(entry);
+    }
+
+    /// Toggle expand/collapse for the currently selected entry.
+    /// No-op if the entry has no expandable content.
+    pub fn toggle_expand(&mut self) {
+        if let Some(entry) = self.entries.get(self.selected_entry) {
+            if !entry.has_expandable_content() {
+                return;
+            }
+        } else {
+            return;
+        }
+
+        if self.expanded_entries.contains(&self.selected_entry) {
+            self.expanded_entries.remove(&self.selected_entry);
+        } else {
+            self.expanded_entries.insert(self.selected_entry);
+        }
+    }
+
+    /// Expand all entries that have expandable content
+    pub fn expand_all(&mut self) {
+        for (i, entry) in self.entries.iter().enumerate() {
+            if entry.has_expandable_content() {
+                self.expanded_entries.insert(i);
+            }
+        }
+    }
+
+    /// Collapse all entries
+    pub fn collapse_all(&mut self) {
+        self.expanded_entries.clear();
+    }
+
+    /// Move cursor to the next entry in the filtered list
+    pub fn select_next_entry(&mut self) {
+        let indices = self.filtered_entry_indices();
+        if let Some(pos) = indices.iter().position(|&idx| idx >= self.selected_entry) {
+            if indices[pos] == self.selected_entry {
+                // Currently on a filtered entry, move to next
+                if pos + 1 < indices.len() {
+                    self.selected_entry = indices[pos + 1];
+                }
+            } else {
+                // Not on a filtered entry, snap to this one
+                self.selected_entry = indices[pos];
+            }
+        }
+    }
+
+    /// Move cursor to the previous entry in the filtered list
+    pub fn select_previous_entry(&mut self) {
+        let indices = self.filtered_entry_indices();
+        if let Some(pos) = indices.iter().rposition(|&idx| idx <= self.selected_entry) {
+            if indices[pos] == self.selected_entry {
+                // Currently on a filtered entry, move to previous
+                if pos > 0 {
+                    self.selected_entry = indices[pos - 1];
+                }
+            } else {
+                // Not on a filtered entry, snap to this one
+                self.selected_entry = indices[pos];
+            }
+        }
+    }
+
+    /// Jump cursor to the first filtered entry
+    pub fn jump_to_top(&mut self) {
+        let indices = self.filtered_entry_indices();
+        if let Some(&first) = indices.first() {
+            self.selected_entry = first;
+        }
+    }
+
+    /// Jump cursor to the last filtered entry
+    pub fn jump_to_bottom(&mut self) {
+        let indices = self.filtered_entry_indices();
+        if let Some(&last) = indices.last() {
+            self.selected_entry = last;
+        }
+    }
+
+    /// Reset all filters and selection state
+    pub fn reset_filters(&mut self) {
+        self.search_query.clear();
+        self.filter_level = None;
+        self.selected_entry = 0;
+        self.expanded_entries.clear();
+        self.scroll_offset = 0;
+    }
+
+    /// Cycle through log level filters
     pub fn cycle_filter(&mut self) {
         self.filter_level = match self.filter_level {
             None => Some(LogLevel::Debug),
@@ -180,6 +484,7 @@ impl LogsTabState {
         };
     }
 
+    /// Get display name for the current filter level
     pub fn filter_name(&self) -> &'static str {
         match self.filter_level {
             None => "All",
@@ -187,6 +492,60 @@ impl LogsTabState {
         }
     }
 
+    /// Select a file, setting active_file and view_mode, and resetting entries/filters
+    pub fn select_file(&mut self, filename: &str) {
+        self.active_file = Some(filename.to_string());
+        self.view_mode = Some(LogViewMode::for_file(filename));
+        self.entries.clear();
+        self.reset_filters();
+    }
+
+    /// Return indices of entries matching the current level filter and search query.
+    /// Search matches on `entry.message` only (not stacktrace).
+    /// Unknown level always passes the level filter.
+    pub fn filtered_entry_indices(&self) -> Vec<usize> {
+        let query_lower = self.search_query.to_lowercase();
+
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                // Level filter: Unknown always passes
+                if let Some(min_level) = self.filter_level {
+                    if entry.level != LogLevel::Unknown {
+                        let level_order = |l: &LogLevel| -> u8 {
+                            match l {
+                                LogLevel::Debug => 0,
+                                LogLevel::Info => 1,
+                                LogLevel::Notice => 2,
+                                LogLevel::Warning => 3,
+                                LogLevel::Error => 4,
+                                LogLevel::Critical => 5,
+                                LogLevel::Alert => 6,
+                                LogLevel::Emergency => 7,
+                                LogLevel::Unknown => 0,
+                            }
+                        };
+                        if level_order(&entry.level) < level_order(&min_level) {
+                            return false;
+                        }
+                    }
+                }
+
+                // Search filter: match on message only
+                if !query_lower.is_empty() && !entry.message.to_lowercase().contains(&query_lower) {
+                    return false;
+                }
+
+                true
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    // ---- Legacy compatibility methods ----
+
+    /// Cycle through available files (legacy)
     pub fn cycle_file(&mut self) {
         if self.available_files.is_empty() {
             return;
@@ -210,6 +569,7 @@ impl LogsTabState {
         };
     }
 
+    /// Get display name for the selected file (legacy)
     pub fn file_name(&self) -> &str {
         match &self.selected_file {
             None => "All",
@@ -1183,11 +1543,8 @@ pub struct App {
     /// Order of processes for display
     pub process_order: Vec<ProcessId>,
 
-    /// Laravel log lines (ring buffer)
+    /// Laravel log lines (legacy — will be removed in Task 7)
     pub log_lines: VecDeque<LogLine>,
-
-    /// Maximum number of log lines to keep
-    pub max_log_lines: usize,
 
     /// Working directory (Laravel project root)
     pub working_dir: PathBuf,
@@ -1217,7 +1574,7 @@ impl App {
             is_sail: false,
             active_tab: Tab::default(),
             processes_tab: ProcessesTabState::default(),
-            logs_tab: LogsTabState::default(),
+            logs_tab: LogsTabState::new(),
             artisan_tab: ArtisanTabState::default(),
             make_tab: MakeTabState::default(),
             quality_tab: QualityTabState::default(),
@@ -1225,7 +1582,6 @@ impl App {
             processes: HashMap::new(),
             process_order: Vec::new(),
             log_lines: VecDeque::with_capacity(DEFAULT_MAX_LOG_LINES),
-            max_log_lines: DEFAULT_MAX_LOG_LINES,
             working_dir,
             should_quit: false,
             status_message: None,
@@ -1247,8 +1603,8 @@ impl App {
 
         // Apply log config
         if let Some(ref cfg) = config {
-            // Set max log lines
-            self.max_log_lines = cfg.log_max_lines();
+            // Set max log entries
+            self.logs_tab.max_entries = cfg.log_max_lines();
 
             // Apply default log filter
             if let Some(filter) = cfg.default_log_filter() {
@@ -1356,8 +1712,9 @@ impl App {
 
     /// Add log lines from Laravel log
     pub fn add_log_lines(&mut self, entries: Vec<crate::log::RawLogEntry>) {
+        let max = self.logs_tab.max_entries;
         for entry in entries {
-            // Track available files
+            // Track available files (legacy)
             if !self.logs_tab.available_files.contains(&entry.file) {
                 self.logs_tab.available_files.push(entry.file.clone());
                 self.logs_tab.available_files.sort();
@@ -1370,7 +1727,7 @@ impl App {
                 file: entry.file,
             };
 
-            if self.log_lines.len() >= self.max_log_lines {
+            if self.log_lines.len() >= max {
                 self.log_lines.pop_front();
             }
             self.log_lines.push_back(log_line);
@@ -1443,6 +1800,9 @@ impl App {
     /// Clear all log lines
     pub fn clear_logs(&mut self) {
         self.log_lines.clear();
+        self.logs_tab.entries.clear();
+        self.logs_tab.expanded_entries.clear();
+        self.logs_tab.selected_entry = 0;
         self.logs_tab.scroll_offset = 0;
     }
 
@@ -1503,5 +1863,331 @@ impl App {
 
     pub fn go_to_tab(&mut self, tab: Tab) {
         self.active_tab = tab;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a ParsedLogEntry with minimal fields
+    fn make_entry(level: LogLevel, message: &str) -> ParsedLogEntry {
+        ParsedLogEntry {
+            timestamp: "2026-05-23 10:00:00".to_string(),
+            environment: "local".to_string(),
+            level,
+            message: message.to_string(),
+            payload: None,
+            context: None,
+            stacktrace: None,
+            raw: String::new(),
+        }
+    }
+
+    /// Helper to create a ParsedLogEntry with expandable content (payload)
+    fn make_expandable_entry(level: LogLevel, message: &str) -> ParsedLogEntry {
+        ParsedLogEntry {
+            timestamp: "2026-05-23 10:00:00".to_string(),
+            environment: "local".to_string(),
+            level,
+            message: message.to_string(),
+            payload: Some(r#"{"key":"value"}"#.to_string()),
+            context: None,
+            stacktrace: None,
+            raw: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_file_tree_ordering_laravel_log_first() {
+        let mut tree = LogFileTree::new();
+        tree.update_files(vec![
+            "auth-2026-05-22.log".to_string(),
+            "laravel.log".to_string(),
+            "queue-2026-05-21.log".to_string(),
+        ]);
+
+        assert_eq!(tree.files[0], "laravel.log");
+    }
+
+    #[test]
+    fn test_file_tree_ordering_by_date_desc() {
+        let mut tree = LogFileTree::new();
+        tree.update_files(vec![
+            "auth-2026-05-20.log".to_string(),
+            "laravel.log".to_string(),
+            "queue-2026-05-22.log".to_string(),
+            "auth-2026-05-22.log".to_string(),
+            "queue-2026-05-21.log".to_string(),
+            "debug.log".to_string(),
+        ]);
+
+        assert_eq!(tree.files[0], "laravel.log");
+        // Next: 2026-05-22 files sorted alphabetically
+        assert_eq!(tree.files[1], "auth-2026-05-22.log");
+        assert_eq!(tree.files[2], "queue-2026-05-22.log");
+        // Then 2026-05-21
+        assert_eq!(tree.files[3], "queue-2026-05-21.log");
+        // Then 2026-05-20
+        assert_eq!(tree.files[4], "auth-2026-05-20.log");
+        // Files without dates last, alphabetically
+        assert_eq!(tree.files[5], "debug.log");
+    }
+
+    #[test]
+    fn test_entry_expand_collapse() {
+        let mut state = LogsTabState::new();
+
+        // Add a non-expandable entry
+        state.add_entry(make_entry(LogLevel::Info, "simple message"));
+        // Add an expandable entry
+        state.add_entry(make_expandable_entry(LogLevel::Error, "error with payload"));
+
+        // Try to toggle non-expandable entry (should be no-op)
+        state.selected_entry = 0;
+        state.toggle_expand();
+        assert!(
+            state.expanded_entries.is_empty(),
+            "non-expandable entry should not be added"
+        );
+
+        // Toggle expandable entry
+        state.selected_entry = 1;
+        state.toggle_expand();
+        assert!(state.expanded_entries.contains(&1));
+
+        // Toggle again to collapse
+        state.toggle_expand();
+        assert!(!state.expanded_entries.contains(&1));
+    }
+
+    #[test]
+    fn test_expand_all_collapse_all() {
+        let mut state = LogsTabState::new();
+
+        state.add_entry(make_entry(LogLevel::Info, "simple 1"));
+        state.add_entry(make_expandable_entry(LogLevel::Error, "expandable 1"));
+        state.add_entry(make_entry(LogLevel::Debug, "simple 2"));
+        state.add_entry(make_expandable_entry(LogLevel::Warning, "expandable 2"));
+
+        state.expand_all();
+        // Only entries 1 and 3 are expandable
+        assert_eq!(state.expanded_entries.len(), 2);
+        assert!(state.expanded_entries.contains(&1));
+        assert!(state.expanded_entries.contains(&3));
+        assert!(!state.expanded_entries.contains(&0));
+        assert!(!state.expanded_entries.contains(&2));
+
+        state.collapse_all();
+        assert!(state.expanded_entries.is_empty());
+    }
+
+    #[test]
+    fn test_cursor_navigation() {
+        let mut state = LogsTabState::new();
+
+        state.add_entry(make_entry(LogLevel::Info, "entry 0"));
+        state.add_entry(make_entry(LogLevel::Warning, "entry 1"));
+        state.add_entry(make_entry(LogLevel::Error, "entry 2"));
+
+        // Start at 0
+        state.selected_entry = 0;
+
+        state.select_next_entry();
+        assert_eq!(state.selected_entry, 1);
+
+        state.select_next_entry();
+        assert_eq!(state.selected_entry, 2);
+
+        // At the end, should not go further
+        state.select_next_entry();
+        assert_eq!(state.selected_entry, 2);
+
+        state.select_previous_entry();
+        assert_eq!(state.selected_entry, 1);
+
+        state.select_previous_entry();
+        assert_eq!(state.selected_entry, 0);
+
+        // At the beginning, should not go further
+        state.select_previous_entry();
+        assert_eq!(state.selected_entry, 0);
+
+        // Jump to bottom
+        state.jump_to_bottom();
+        assert_eq!(state.selected_entry, 2);
+
+        // Jump to top
+        state.jump_to_top();
+        assert_eq!(state.selected_entry, 0);
+    }
+
+    #[test]
+    fn test_filter_reset_on_file_change() {
+        let mut state = LogsTabState::new();
+
+        // Set up some state
+        state.search_query = "test".to_string();
+        state.filter_level = Some(LogLevel::Error);
+        state.selected_entry = 5;
+        state.expanded_entries.insert(2);
+        state.scroll_offset = 10;
+        state.add_entry(make_entry(LogLevel::Info, "old entry"));
+
+        // Select a new file
+        state.select_file("auth-2026-05-22.log");
+
+        assert_eq!(state.active_file.as_deref(), Some("auth-2026-05-22.log"));
+        assert_eq!(state.view_mode, Some(LogViewMode::Static),);
+        assert!(state.entries.is_empty(), "entries should be cleared");
+        assert!(state.search_query.is_empty(), "search should be cleared");
+        assert!(state.filter_level.is_none(), "filter should be cleared");
+        assert_eq!(state.selected_entry, 0);
+        assert!(state.expanded_entries.is_empty());
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_live_mode_detection() {
+        assert_eq!(LogViewMode::for_file("laravel.log"), LogViewMode::Live);
+        assert_eq!(
+            LogViewMode::for_file("auth-2026-05-22.log"),
+            LogViewMode::Static
+        );
+        assert_eq!(LogViewMode::for_file("queue.log"), LogViewMode::Static);
+
+        assert_eq!(LogViewMode::Live.indicator(), "⏺ LIVE");
+        assert_eq!(LogViewMode::Static.indicator(), "⏸ STATIC");
+    }
+
+    #[test]
+    fn test_buffer_limit() {
+        let mut state = LogsTabState::new();
+        state.max_entries = 3;
+
+        state.add_entry(make_entry(LogLevel::Info, "entry 0"));
+        state.add_entry(make_expandable_entry(LogLevel::Warning, "entry 1"));
+        state.add_entry(make_entry(LogLevel::Error, "entry 2"));
+
+        assert_eq!(state.entries.len(), 3);
+
+        // Expand entry at index 1
+        state.selected_entry = 1;
+        state.toggle_expand();
+        assert!(state.expanded_entries.contains(&1));
+
+        // Set selected_entry to 2
+        state.selected_entry = 2;
+
+        // Add one more, should pop front and shift indices
+        state.add_entry(make_entry(LogLevel::Debug, "entry 3"));
+
+        assert_eq!(state.entries.len(), 3);
+        // Entry 0 was popped. Old entry 1 is now at index 0, old entry 2 at 1, new entry 3 at 2.
+        assert_eq!(state.entries[0].message, "entry 1");
+        assert_eq!(state.entries[1].message, "entry 2");
+        assert_eq!(state.entries[2].message, "entry 3");
+
+        // Expanded index 1 should now be 0
+        assert!(state.expanded_entries.contains(&0));
+        assert!(!state.expanded_entries.contains(&1));
+
+        // selected_entry was 2, should shift to 1
+        assert_eq!(state.selected_entry, 1);
+    }
+
+    #[test]
+    fn test_extract_date_from_filename() {
+        assert_eq!(
+            extract_date_from_filename("auth-2026-05-22.log"),
+            Some("2026-05-22")
+        );
+        assert_eq!(
+            extract_date_from_filename("queue-worker-2026-01-15.log"),
+            Some("2026-01-15")
+        );
+        assert_eq!(extract_date_from_filename("laravel.log"), None);
+        assert_eq!(extract_date_from_filename("debug.log"), None);
+    }
+
+    #[test]
+    fn test_filtered_entry_indices_level_filter() {
+        let mut state = LogsTabState::new();
+
+        state.add_entry(make_entry(LogLevel::Debug, "debug msg"));
+        state.add_entry(make_entry(LogLevel::Info, "info msg"));
+        state.add_entry(make_entry(LogLevel::Warning, "warning msg"));
+        state.add_entry(make_entry(LogLevel::Error, "error msg"));
+        state.add_entry(make_entry(LogLevel::Unknown, "unknown msg"));
+
+        // No filter: all pass
+        let indices = state.filtered_entry_indices();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4]);
+
+        // Filter Warning+: indices 2 (Warning), 3 (Error), 4 (Unknown always passes)
+        state.filter_level = Some(LogLevel::Warning);
+        let indices = state.filtered_entry_indices();
+        assert_eq!(indices, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn test_filtered_entry_indices_search() {
+        let mut state = LogsTabState::new();
+
+        state.add_entry(make_entry(LogLevel::Info, "User logged in"));
+        state.add_entry(make_entry(LogLevel::Info, "Payment processed"));
+        state.add_entry(make_entry(LogLevel::Error, "User not found"));
+
+        state.search_query = "user".to_string();
+        let indices = state.filtered_entry_indices();
+        assert_eq!(indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn test_file_tree_select_next_previous() {
+        let mut tree = LogFileTree::new();
+        tree.update_files(vec![
+            "laravel.log".to_string(),
+            "auth.log".to_string(),
+            "queue.log".to_string(),
+        ]);
+
+        assert_eq!(tree.selected_index, 0);
+        assert_eq!(tree.selected_file(), Some("laravel.log"));
+
+        tree.select_next();
+        assert_eq!(tree.selected_index, 1);
+
+        tree.select_next();
+        assert_eq!(tree.selected_index, 2);
+
+        // Should not go past the end
+        tree.select_next();
+        assert_eq!(tree.selected_index, 2);
+
+        tree.select_previous();
+        assert_eq!(tree.selected_index, 1);
+
+        tree.select_previous();
+        assert_eq!(tree.selected_index, 0);
+
+        // Should not go below 0
+        tree.select_previous();
+        assert_eq!(tree.selected_index, 0);
+    }
+
+    #[test]
+    fn test_file_tree_update_resets_out_of_bounds_index() {
+        let mut tree = LogFileTree::new();
+        tree.update_files(vec![
+            "a.log".to_string(),
+            "b.log".to_string(),
+            "c.log".to_string(),
+        ]);
+        tree.selected_index = 2;
+
+        // Update with fewer files; index should reset
+        tree.update_files(vec!["a.log".to_string()]);
+        assert_eq!(tree.selected_index, 0);
     }
 }
