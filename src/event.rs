@@ -3,7 +3,7 @@
 use crossterm::event::KeyEvent;
 
 use crate::app::SystemStats;
-use crate::log::RawLogEntry;
+use crate::log::{ParsedLogEntry, RawLogEntry};
 use crate::process::types::ProcessId;
 
 /// Events that can occur in the application
@@ -30,6 +30,15 @@ pub enum Event {
 
     /// New content from log files
     LogUpdate(Vec<RawLogEntry>),
+
+    /// The set of .log files in storage/logs/ has changed (startup or file created/deleted)
+    LogFilesChanged(Vec<String>),
+
+    /// A static log file has been fully read on demand
+    LogFileLoaded {
+        filename: String,
+        entries: Vec<ParsedLogEntry>,
+    },
 
     /// Terminal resize event
     Resize(u16, u16),

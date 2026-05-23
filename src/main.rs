@@ -418,6 +418,12 @@ async fn run(working_dir: PathBuf, pid_registry: process::PidRegistry) -> Result
                 Event::LogUpdate(lines) => {
                     app.add_log_lines(lines);
                 }
+                Event::LogFilesChanged(_filenames) => {
+                    // Will be wired up in Task 6
+                }
+                Event::LogFileLoaded { .. } => {
+                    // Will be wired up in Task 6
+                }
                 Event::CommandOutput { line, is_stderr } => {
                     let output_line = if is_stderr {
                         OutputLine::stderr(line)
