@@ -1355,7 +1355,7 @@ impl App {
     }
 
     /// Add log lines from Laravel log
-    pub fn add_log_lines(&mut self, entries: Vec<crate::log::LogEntry>) {
+    pub fn add_log_lines(&mut self, entries: Vec<crate::log::RawLogEntry>) {
         for entry in entries {
             // Track available files
             if !self.logs_tab.available_files.contains(&entry.file) {

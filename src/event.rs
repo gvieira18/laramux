@@ -3,7 +3,7 @@
 use crossterm::event::KeyEvent;
 
 use crate::app::SystemStats;
-use crate::log::LogEntry;
+use crate::log::RawLogEntry;
 use crate::process::types::ProcessId;
 
 /// Events that can occur in the application
@@ -29,7 +29,7 @@ pub enum Event {
     ProcessAutoRestart { id: ProcessId },
 
     /// New content from log files
-    LogUpdate(Vec<LogEntry>),
+    LogUpdate(Vec<RawLogEntry>),
 
     /// Terminal resize event
     Resize(u16, u16),
