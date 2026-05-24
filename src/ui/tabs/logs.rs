@@ -412,6 +412,9 @@ fn render_entries(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("[f] ", Style::default().fg(Theme::ACCENT)),
             Span::styled("Level", Style::default().fg(Theme::TEXT_DIM)),
             Span::raw("  "),
+            Span::styled("[y] ", Style::default().fg(Theme::ACCENT)),
+            Span::styled("Copy", Style::default().fg(Theme::TEXT_DIM)),
+            Span::raw("  "),
             Span::styled("[g/G] ", Style::default().fg(Theme::ACCENT)),
             Span::styled("Top/Bottom", Style::default().fg(Theme::TEXT_DIM)),
         ])
