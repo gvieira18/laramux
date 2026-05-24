@@ -985,13 +985,9 @@ fn handle_logs_keys(
                         match arboard::Clipboard::new() {
                             Ok(mut clipboard) => match clipboard.set_text(&entry.raw) {
                                 Ok(_) => app.set_status("Entry copied to clipboard"),
-                                Err(e) => {
-                                    app.set_status(format!("Clipboard error: {}", e))
-                                }
+                                Err(e) => app.set_status(format!("Clipboard error: {}", e)),
                             },
-                            Err(e) => {
-                                app.set_status(format!("Clipboard unavailable: {}", e))
-                            }
+                            Err(e) => app.set_status(format!("Clipboard unavailable: {}", e)),
                         }
                     }
                 }
