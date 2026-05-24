@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
@@ -9,12 +9,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
 use crate::event::Event;
+use crate::log::entry::LogEntryParser;
 
-/// A log line with its source file
+/// A raw log line from a watched file
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub content: String,
-    pub file: String,
 }
 
 /// Watch Laravel log directory for changes
@@ -45,7 +45,16 @@ impl LogWatcher {
         self
     }
 
-    /// Start watching the log directory for any .log files
+    /// Start watching the log directory.
+    ///
+    /// On startup:
+    /// - Scans `storage/logs/` for all `.log` files and emits `LogFilesChanged`.
+    /// - Only sets up tail-follow (incremental reading) for `laravel.log` and
+    ///   any `additional_files` — NOT for every `.log` file.
+    ///
+    /// At runtime:
+    /// - When a new `.log` file is created, re-scans and emits `LogFilesChanged`.
+    /// - Continues to tail `laravel.log` and `additional_files` for `LogUpdate`.
     pub async fn watch(self) -> Result<()> {
         let log_dir = self.log_dir.clone();
         let additional_files = self.additional_files.clone();
@@ -88,55 +97,53 @@ impl LogWatcher {
         let mut file_positions: std::collections::HashMap<PathBuf, u64> =
             std::collections::HashMap::new();
 
-        // Initialize positions for existing log files and load recent history
-        if let Ok(entries) = std::fs::read_dir(&log_dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
+        // Scan for all .log files and emit LogFilesChanged on startup
+        let mut known_log_files: HashSet<String> = HashSet::new();
+        if let Ok(dir_entries) = std::fs::read_dir(&log_dir) {
+            for dir_entry in dir_entries.filter_map(|e| e.ok()) {
+                let path = dir_entry.path();
                 if path.extension().map(|ext| ext == "log").unwrap_or(false) {
-                    let file_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-
-                    // Read last 5 lines as initial history
-                    if let Ok(recent_lines) = read_last_n_lines(&path, 5) {
-                        if !recent_lines.is_empty() {
-                            let entries: Vec<LogEntry> = recent_lines
-                                .into_iter()
-                                .map(|content| LogEntry {
-                                    content,
-                                    file: file_name.clone(),
-                                })
-                                .collect();
-                            let _ = event_tx.send(Event::LogUpdate(entries)).await;
-                        }
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        known_log_files.insert(name.to_string());
                     }
-                    // Set position to end of file for future reads
-                    let pos = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    file_positions.insert(path, pos);
                 }
             }
+        }
+        {
+            let mut filenames: Vec<String> = known_log_files.iter().cloned().collect();
+            filenames.sort();
+            let _ = event_tx.send(Event::LogFilesChanged(filenames)).await;
+        }
+
+        // Only tail-follow laravel.log (not all .log files)
+        let laravel_log = log_dir.join("laravel.log");
+        if laravel_log.exists() {
+            // Read last 5 lines as initial history
+            if let Ok(recent_lines) = read_last_n_lines(&laravel_log, 5) {
+                if !recent_lines.is_empty() {
+                    let entries: Vec<LogEntry> = recent_lines
+                        .into_iter()
+                        .map(|content| LogEntry { content })
+                        .collect();
+                    let _ = event_tx.send(Event::LogUpdate(entries)).await;
+                }
+            }
+            // Set position to end of file for future reads
+            let pos = std::fs::metadata(&laravel_log)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            file_positions.insert(laravel_log.clone(), pos);
         }
 
         // Initialize positions for additional files
         for file in &additional_files {
             if file.exists() {
-                let file_name = file
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
                 // Read last 5 lines as initial history
                 if let Ok(recent_lines) = read_last_n_lines(file, 5) {
                     if !recent_lines.is_empty() {
                         let entries: Vec<LogEntry> = recent_lines
                             .into_iter()
-                            .map(|content| LogEntry {
-                                content,
-                                file: file_name.clone(),
-                            })
+                            .map(|content| LogEntry { content })
                             .collect();
                         let _ = event_tx.send(Event::LogUpdate(entries)).await;
                     }
@@ -154,26 +161,40 @@ impl LogWatcher {
                 }
                 Some(event) = fs_rx.recv() => {
                     if let Ok(event) = event {
-                        // Process any .log file events
                         for path in event.paths.iter() {
                             let is_log_file = path.extension().map(|ext| ext == "log").unwrap_or(false);
-
-                            // Check if this is a file we should process:
-                            // 1. Any .log file in the main log directory
-                            // 2. Specifically watched additional files
-                            let in_log_dir = path.parent() == Some(&log_dir);
+                            let in_log_dir = path.parent() == Some(log_dir.as_path());
                             let is_watched_file = watched_files.contains(path);
-                            let should_process = (is_log_file && in_log_dir) || is_watched_file;
 
-                            if should_process
-                                && matches!(event.kind, notify::EventKind::Modify(_) | notify::EventKind::Create(_))
+                            // When a new .log file is created in the log dir, re-scan and emit LogFilesChanged
+                            if is_log_file
+                                && in_log_dir
+                                && matches!(event.kind, notify::EventKind::Create(_))
                             {
-                                let file_name = path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
+                                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                    if known_log_files.insert(name.to_string()) {
+                                        // New file appeared — re-emit file list
+                                        let mut filenames: Vec<String> =
+                                            known_log_files.iter().cloned().collect();
+                                        filenames.sort();
+                                        let _ = event_tx
+                                            .send(Event::LogFilesChanged(filenames))
+                                            .await;
+                                    }
+                                }
+                            }
 
+                            // Only tail-follow laravel.log (in log_dir) or additional watched files
+                            let is_laravel_log = in_log_dir
+                                && path.file_name().and_then(|n| n.to_str()) == Some("laravel.log");
+                            let should_tail = is_laravel_log || is_watched_file;
+
+                            if should_tail
+                                && matches!(
+                                    event.kind,
+                                    notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+                                )
+                            {
                                 // Get or create position tracker for this file
                                 let last_pos = file_positions.entry(path.clone()).or_insert(0);
 
@@ -182,10 +203,7 @@ impl LogWatcher {
                                     if !new_lines.is_empty() {
                                         let entries: Vec<LogEntry> = new_lines
                                             .into_iter()
-                                            .map(|content| LogEntry {
-                                                content,
-                                                file: file_name.clone(),
-                                            })
+                                            .map(|content| LogEntry { content })
                                             .collect();
                                         let _ = event_tx.send(Event::LogUpdate(entries)).await;
                                     }
@@ -261,4 +279,30 @@ pub fn find_log_dir(working_dir: &std::path::Path) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+/// Read the last `max_entries` parsed log entries from a file (static mode).
+///
+/// Returns `(entries, skipped)` where `skipped` is the number of entries
+/// that were parsed but dropped because they exceeded `max_entries`.
+/// This is called synchronously (intended to run inside `spawn_blocking`).
+pub fn read_static_file(
+    path: &Path,
+    max_entries: usize,
+) -> std::io::Result<(Vec<crate::log::entry::LogEntry>, usize)> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let mut parser = LogEntryParser::new();
+    for line in reader.lines() {
+        let line = line?;
+        parser.feed(&line);
+    }
+    let all_entries = parser.flush();
+
+    let total = all_entries.len();
+    let skipped = total.saturating_sub(max_entries);
+    let kept = all_entries.into_iter().skip(skipped).collect();
+
+    Ok((kept, skipped))
 }

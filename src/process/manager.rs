@@ -637,7 +637,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let descendants = find_descendant_pids(parent_pid);
-        assert!(!descendants.is_empty(), "should find at least 1 descendant (sleep)");
+        assert!(
+            !descendants.is_empty(),
+            "should find at least 1 descendant (sleep)"
+        );
 
         // Every descendant should be a real PID
         for pid in &descendants {
@@ -687,7 +690,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let descendants = find_descendant_pids(leaf_pid);
-        assert!(descendants.is_empty(), "leaf process should have no descendants");
+        assert!(
+            descendants.is_empty(),
+            "leaf process should have no descendants"
+        );
 
         let _ = leaf.kill();
         let _ = leaf.wait();
@@ -725,12 +731,19 @@ mod tests {
 
         // Root should be fully reaped — signal check returns ESRCH
         let root_dead = nix_kill(Pid::from_raw(root_pid as i32), Signal::SIGCONT).is_err();
-        assert!(root_dead, "root process should be dead after verify_and_cleanup");
+        assert!(
+            root_dead,
+            "root process should be dead after verify_and_cleanup"
+        );
 
         // Descendants were orphaned to init, which reaps them after SIGKILL
         for pid in &descendants_before {
             let alive = nix_kill(Pid::from_raw(*pid as i32), Signal::SIGCONT).is_ok();
-            assert!(!alive, "descendant PID {} should be dead after cleanup", pid);
+            assert!(
+                !alive,
+                "descendant PID {} should be dead after cleanup",
+                pid
+            );
         }
     }
 

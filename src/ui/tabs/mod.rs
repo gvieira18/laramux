@@ -1,6 +1,7 @@
 mod about;
 mod artisan;
 mod config;
+mod log_file_tree;
 mod logs;
 mod make;
 mod processes;
