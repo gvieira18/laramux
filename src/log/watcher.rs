@@ -119,7 +119,7 @@ impl LogWatcher {
         let laravel_log = log_dir.join("laravel.log");
         if laravel_log.exists() {
             // Read last 5 lines as initial history
-            if let Ok(recent_lines) = read_last_n_lines(&laravel_log, 5) {
+            if let Ok(recent_lines) = read_last_n_lines(&laravel_log, 200) {
                 if !recent_lines.is_empty() {
                     let entries: Vec<LogEntry> = recent_lines
                         .into_iter()

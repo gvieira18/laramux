@@ -978,6 +978,20 @@ fn handle_logs_keys(
                     app.logs_tab.scroll_offset = 0;
                 }
             }
+            KeyCode::Char('y') => {
+                let indices = app.logs_tab.filtered_entry_indices();
+                if let Some(&actual_idx) = indices.get(app.logs_tab.selected_entry) {
+                    if let Some(entry) = app.logs_tab.entries.get(actual_idx) {
+                        match arboard::Clipboard::new() {
+                            Ok(mut clipboard) => match clipboard.set_text(&entry.raw) {
+                                Ok(_) => app.set_status("Entry copied to clipboard"),
+                                Err(e) => app.set_status(format!("Clipboard error: {}", e)),
+                            },
+                            Err(e) => app.set_status(format!("Clipboard unavailable: {}", e)),
+                        }
+                    }
+                }
+            }
             KeyCode::Char('g') => app.logs_tab.jump_to_top(),
             KeyCode::Char('G') => app.logs_tab.jump_to_bottom(),
             KeyCode::PageUp => {

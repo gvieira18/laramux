@@ -1,7 +1,7 @@
 BINARY := target/release/laramux
 LOCAL_BIN ?= $(HOME)/.local/bin
 
-.PHONY: build install clean release
+.PHONY: build install clean release fmt lint test ci
 
 build:
 	@cargo build --release
@@ -13,6 +13,17 @@ install: build
 
 clean:
 	@cargo clean
+
+fmt:
+	@cargo fmt --all
+
+lint:
+	@cargo clippy --all-features -- -D warnings
+
+test:
+	@cargo test --all-features
+
+ci: fmt lint test
 
 release:
 ifndef VERSION

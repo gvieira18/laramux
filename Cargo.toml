@@ -24,6 +24,7 @@ anyhow = "1.0"
 futures = "0.3"
 ansi-to-tui = "6"
 sysinfo = "0.32"
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal"] }
